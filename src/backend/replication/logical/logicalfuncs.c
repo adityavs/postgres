@@ -6,7 +6,7 @@
  *	   logical replication slots via SQL.
  *
  *
- * Copyright (c) 2012-2016, PostgreSQL Global Development Group
+ * Copyright (c) 2012-2018, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/replication/logicalfuncs.c
@@ -37,6 +37,7 @@
 #include "utils/inval.h"
 #include "utils/memutils.h"
 #include "utils/pg_lsn.h"
+#include "utils/regproc.h"
 #include "utils/resowner.h"
 #include "utils/lsyscache.h"
 
@@ -98,7 +99,7 @@ LogicalOutputWrite(LogicalDecodingContext *ctx, XLogRecPtr lsn, TransactionId xi
 
 	/* ick, but cstring_to_text_with_len works for bytea perfectly fine */
 	values[2] = PointerGetDatum(
-					cstring_to_text_with_len(ctx->out->data, ctx->out->len));
+								cstring_to_text_with_len(ctx->out->data, ctx->out->len));
 
 	tuplestore_putvalues(p->tupstore, p->tupdesc, values, nulls);
 	p->returned_rows++;
@@ -115,7 +116,7 @@ check_permissions(void)
 
 int
 logical_read_local_xlog_page(XLogReaderState *state, XLogRecPtr targetPagePtr,
-	int reqLen, XLogRecPtr targetRecPtr, char *cur_page, TimeLineID *pageTLI)
+							 int reqLen, XLogRecPtr targetRecPtr, char *cur_page, TimeLineID *pageTLI)
 {
 	return read_local_xlog_page(state, targetPagePtr, reqLen,
 								targetRecPtr, cur_page, pageTLI);
@@ -225,7 +226,7 @@ pg_logical_slot_get_changes_guts(FunctionCallInfo fcinfo, bool confirm, bool bin
 			char	   *name = TextDatumGetCString(datum_opts[i]);
 			char	   *opt = TextDatumGetCString(datum_opts[i + 1]);
 
-			options = lappend(options, makeDefElem(name, (Node *) makeString(opt)));
+			options = lappend(options, makeDefElem(name, (Node *) makeString(opt), -1));
 		}
 	}
 
@@ -234,19 +235,26 @@ pg_logical_slot_get_changes_guts(FunctionCallInfo fcinfo, bool confirm, bool bin
 	rsinfo->setResult = p->tupstore;
 	rsinfo->setDesc = p->tupdesc;
 
-	ReplicationSlotAcquire(NameStr(*name));
+	/*
+	 * Compute the current end-of-wal and maintain ThisTimeLineID.
+	 * RecoveryInProgress() will update ThisTimeLineID on promotion.
+	 */
+	if (!RecoveryInProgress())
+		end_of_wal = GetFlushRecPtr();
+	else
+		end_of_wal = GetXLogReplayRecPtr(&ThisTimeLineID);
+
+	ReplicationSlotAcquire(NameStr(*name), true);
 
 	PG_TRY();
 	{
-		/*
-		 * Passing InvalidXLogRecPtr here causes replay to start at the slot's
-		 * confirmed_flush.
-		 */
+		/* restart at slot's confirmed_flush */
 		ctx = CreateDecodingContext(InvalidXLogRecPtr,
 									options,
+									false,
 									logical_read_local_xlog_page,
 									LogicalOutputPrepareWrite,
-									LogicalOutputWrite);
+									LogicalOutputWrite, NULL);
 
 		MemoryContextSwitchTo(oldcontext);
 
@@ -265,25 +273,14 @@ pg_logical_slot_get_changes_guts(FunctionCallInfo fcinfo, bool confirm, bool bin
 		ctx->output_writer_private = p;
 
 		/*
-		 * We start reading xlog from the restart lsn, even though in
-		 * CreateDecodingContext we set the snapshot builder up using the
-		 * slot's confirmed_flush. This means we might read xlog we don't
-		 * actually decode rows from, but the snapshot builder might need it
-		 * to get to a consistent point. The point we start returning data to
-		 * *users* at is the confirmed_flush lsn set up in the decoding
-		 * context.
+		 * Decoding of WAL must start at restart_lsn so that the entirety of
+		 * xacts that committed after the slot's confirmed_flush can be
+		 * accumulated into reorder buffers.
 		 */
 		startptr = MyReplicationSlot->data.restart_lsn;
 
-		CurrentResourceOwner = ResourceOwnerCreate(CurrentResourceOwner, "logical decoding");
-
 		/* invalidate non-timetravel entries */
 		InvalidateSystemCaches();
-
-		if (!RecoveryInProgress())
-			end_of_wal = GetFlushRecPtr();
-		else
-			end_of_wal = GetXLogReplayRecPtr(NULL);
 
 		/* Decode until we run out of records */
 		while ((startptr != InvalidXLogRecPtr && startptr < end_of_wal) ||
@@ -321,6 +318,11 @@ pg_logical_slot_get_changes_guts(FunctionCallInfo fcinfo, bool confirm, bool bin
 
 		tuplestore_donestoring(tupstore);
 
+		/*
+		 * Logical decoding could have clobbered CurrentResourceOwner during
+		 * transaction management, so restore the executor's value.  (This is
+		 * a kluge, but it's not worth cleaning up right now.)
+		 */
 		CurrentResourceOwner = old_resowner;
 
 		/*
@@ -328,7 +330,24 @@ pg_logical_slot_get_changes_guts(FunctionCallInfo fcinfo, bool confirm, bool bin
 		 * business..)
 		 */
 		if (ctx->reader->EndRecPtr != InvalidXLogRecPtr && confirm)
+		{
 			LogicalConfirmReceivedLocation(ctx->reader->EndRecPtr);
+
+			/*
+			 * If only the confirmed_flush_lsn has changed the slot won't get
+			 * marked as dirty by the above. Callers on the walsender
+			 * interface are expected to keep track of their own progress and
+			 * don't need it written out. But SQL-interface users cannot
+			 * specify their own start positions and it's harder for them to
+			 * keep track of their progress, so we should make more of an
+			 * effort to save it for them.
+			 *
+			 * Dirty the slot so it's written out at the next checkpoint.
+			 * We'll still lose its position on crash, as documented, but it's
+			 * better than always losing the position even on clean restart.
+			 */
+			ReplicationSlotMarkDirty();
+		}
 
 		/* free context, call shutdown callback */
 		FreeDecodingContext(ctx);
@@ -386,7 +405,7 @@ pg_logical_slot_peek_binary_changes(PG_FUNCTION_ARGS)
 
 
 /*
- * SQL function for writing logical decding message into WAL.
+ * SQL function for writing logical decoding message into WAL.
  */
 Datum
 pg_logical_emit_message_bytea(PG_FUNCTION_ARGS)

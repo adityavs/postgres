@@ -3,7 +3,7 @@
  * blinsert.c
  *		Bloom index build and insert functions.
  *
- * Copyright (c) 2016, PostgreSQL Global Development Group
+ * Copyright (c) 2016-2018, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  contrib/bloom/blinsert.c
@@ -18,6 +18,7 @@
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
 #include "storage/indexfsm.h"
+#include "storage/smgr.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 
@@ -32,11 +33,12 @@ PG_MODULE_MAGIC;
 typedef struct
 {
 	BloomState	blstate;		/* bloom index state */
-	MemoryContext tmpCtx;		/* temporary memory context reset after
-								 * each tuple */
-	char		data[BLCKSZ];	/* cached page */
-	int64		count;			/* number of tuples in cached page */
-}	BloomBuildState;
+	int64		indtuples;		/* total number of tuples indexed */
+	MemoryContext tmpCtx;		/* temporary memory context reset after each
+								 * tuple */
+	PGAlignedBlock data;		/* cached page */
+	int			count;			/* number of tuples in cached page */
+} BloomBuildState;
 
 /*
  * Flush page cached in BloomBuildState.
@@ -50,7 +52,7 @@ flushCachedPage(Relation index, BloomBuildState *buildstate)
 
 	state = GenericXLogStart(index);
 	page = GenericXLogRegisterBuffer(state, buffer, GENERIC_XLOG_FULL_IMAGE);
-	memcpy(page, buildstate->data, BLCKSZ);
+	memcpy(page, buildstate->data.data, BLCKSZ);
 	GenericXLogFinish(state);
 	UnlockReleaseBuffer(buffer);
 }
@@ -61,8 +63,8 @@ flushCachedPage(Relation index, BloomBuildState *buildstate)
 static void
 initCachedPage(BloomBuildState *buildstate)
 {
-	memset(buildstate->data, 0, BLCKSZ);
-	BloomInitPage(buildstate->data, 0);
+	memset(buildstate->data.data, 0, BLCKSZ);
+	BloomInitPage(buildstate->data.data, 0);
 	buildstate->count = 0;
 }
 
@@ -82,7 +84,7 @@ bloomBuildCallback(Relation index, HeapTuple htup, Datum *values,
 	itup = BloomFormTuple(&buildstate->blstate, &htup->t_self, values, isnull);
 
 	/* Try to add next item to cached page */
-	if (BloomPageAddItem(&buildstate->blstate, buildstate->data, itup))
+	if (BloomPageAddItem(&buildstate->blstate, buildstate->data.data, itup))
 	{
 		/* Next item was added successfully */
 		buildstate->count++;
@@ -96,12 +98,18 @@ bloomBuildCallback(Relation index, HeapTuple htup, Datum *values,
 
 		initCachedPage(buildstate);
 
-		if (!BloomPageAddItem(&buildstate->blstate, buildstate->data, itup))
+		if (!BloomPageAddItem(&buildstate->blstate, buildstate->data.data, itup))
 		{
 			/* We shouldn't be here since we're inserting to the empty page */
 			elog(ERROR, "could not add new bloom tuple to empty page");
 		}
+
+		/* Next item was added successfully */
+		buildstate->count++;
 	}
+
+	/* Update total tuple count */
+	buildstate->indtuples += 1;
 
 	MemoryContextSwitchTo(oldCtx);
 	MemoryContextReset(buildstate->tmpCtx);
@@ -129,26 +137,23 @@ blbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	initBloomState(&buildstate.blstate, index);
 	buildstate.tmpCtx = AllocSetContextCreate(CurrentMemoryContext,
 											  "Bloom build temporary context",
-											  ALLOCSET_DEFAULT_MINSIZE,
-											  ALLOCSET_DEFAULT_INITSIZE,
-											  ALLOCSET_DEFAULT_MAXSIZE);
+											  ALLOCSET_DEFAULT_SIZES);
 	initCachedPage(&buildstate);
 
 	/* Do the heap scan */
 	reltuples = IndexBuildHeapScan(heap, index, indexInfo, true,
-								   bloomBuildCallback, (void *) &buildstate);
+								   bloomBuildCallback, (void *) &buildstate,
+								   NULL);
 
-	/*
-	 * There are could be some items in cached page.  Flush this page
-	 * if needed.
-	 */
+	/* Flush last page if needed (it will be, unless heap was empty) */
 	if (buildstate.count > 0)
 		flushCachedPage(index, &buildstate);
 
 	MemoryContextDelete(buildstate.tmpCtx);
 
 	result = (IndexBuildResult *) palloc(sizeof(IndexBuildResult));
-	result->heap_tuples = result->index_tuples = reltuples;
+	result->heap_tuples = reltuples;
+	result->index_tuples = buildstate.indtuples;
 
 	return result;
 }
@@ -159,12 +164,31 @@ blbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 void
 blbuildempty(Relation index)
 {
-	if (RelationGetNumberOfBlocks(index) != 0)
-		elog(ERROR, "index \"%s\" already contains data",
-			 RelationGetRelationName(index));
+	Page		metapage;
 
-	/* Initialize the meta page */
-	BloomInitMetapage(index);
+	/* Construct metapage. */
+	metapage = (Page) palloc(BLCKSZ);
+	BloomFillMetapage(index, metapage);
+
+	/*
+	 * Write the page and log it.  It might seem that an immediate sync would
+	 * be sufficient to guarantee that the file exists on disk, but recovery
+	 * itself might remove it while replaying, for example, an
+	 * XLOG_DBASE_CREATE or XLOG_TBLSPC_CREATE record.  Therefore, we need
+	 * this even when wal_level=minimal.
+	 */
+	PageSetChecksumInplace(metapage, BLOOM_METAPAGE_BLKNO);
+	smgrwrite(index->rd_smgr, INIT_FORKNUM, BLOOM_METAPAGE_BLKNO,
+			  (char *) metapage, true);
+	log_newpage(&index->rd_smgr->smgr_rnode.node, INIT_FORKNUM,
+				BLOOM_METAPAGE_BLKNO, metapage, true);
+
+	/*
+	 * An immediate sync is required even if we xlog'd the page, because the
+	 * write did not go through shared_buffers and therefore a concurrent
+	 * checkpoint may have moved the redo pointer past our xlog record.
+	 */
+	smgrimmedsync(index->rd_smgr, INIT_FORKNUM);
 }
 
 /*
@@ -172,7 +196,9 @@ blbuildempty(Relation index)
  */
 bool
 blinsert(Relation index, Datum *values, bool *isnull,
-		 ItemPointer ht_ctid, Relation heapRel, IndexUniqueCheck checkUnique)
+		 ItemPointer ht_ctid, Relation heapRel,
+		 IndexUniqueCheck checkUnique,
+		 IndexInfo *indexInfo)
 {
 	BloomState	blstate;
 	BloomTuple *itup;
@@ -189,9 +215,7 @@ blinsert(Relation index, Datum *values, bool *isnull,
 
 	insertCtx = AllocSetContextCreate(CurrentMemoryContext,
 									  "Bloom insert temporary context",
-									  ALLOCSET_DEFAULT_MINSIZE,
-									  ALLOCSET_DEFAULT_INITSIZE,
-									  ALLOCSET_DEFAULT_MAXSIZE);
+									  ALLOCSET_DEFAULT_SIZES);
 
 	oldCtx = MemoryContextSwitchTo(insertCtx);
 
@@ -204,8 +228,7 @@ blinsert(Relation index, Datum *values, bool *isnull,
 	 */
 	metaBuffer = ReadBuffer(index, BLOOM_METAPAGE_BLKNO);
 	LockBuffer(metaBuffer, BUFFER_LOCK_SHARE);
-	metaData = BloomPageGetMeta(BufferGetPage(metaBuffer, NULL, NULL,
-											  BGP_NO_SNAPSHOT_TEST));
+	metaData = BloomPageGetMeta(BufferGetPage(metaBuffer));
 
 	if (metaData->nEnd > metaData->nStart)
 	{
@@ -222,6 +245,13 @@ blinsert(Relation index, Datum *values, bool *isnull,
 
 		state = GenericXLogStart(index);
 		page = GenericXLogRegisterBuffer(state, buffer, 0);
+
+		/*
+		 * We might have found a page that was recently deleted by VACUUM.  If
+		 * so, we can reuse it, but we must reinitialize it.
+		 */
+		if (PageIsNew(page) || BloomPageIsDeleted(page))
+			BloomInitPage(page, 0);
 
 		if (BloomPageAddItem(&blstate, page, itup))
 		{
@@ -280,6 +310,10 @@ blinsert(Relation index, Datum *values, bool *isnull,
 		buffer = ReadBuffer(index, blkno);
 		LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
 		page = GenericXLogRegisterBuffer(state, buffer, 0);
+
+		/* Basically same logic as above */
+		if (PageIsNew(page) || BloomPageIsDeleted(page))
+			BloomInitPage(page, 0);
 
 		if (BloomPageAddItem(&blstate, page, itup))
 		{

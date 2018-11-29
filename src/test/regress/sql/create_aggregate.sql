@@ -86,7 +86,8 @@ create aggregate my_percentile_disc(float8 ORDER BY anyelement) (
   stype = internal,
   sfunc = ordered_set_transition,
   finalfunc = percentile_disc_final,
-  finalfunc_extra = true
+  finalfunc_extra = true,
+  finalfunc_modify = read_write
 );
 
 create aggregate my_rank(VARIADIC "any" ORDER BY VARIADIC "any") (
@@ -117,27 +118,11 @@ CREATE AGGREGATE sumdouble (float8)
 
 -- aggregate combine and serialization functions
 
--- Ensure stype and serialtype can't be the same
+-- can't specify just one of serialfunc and deserialfunc
 CREATE AGGREGATE myavg (numeric)
 (
 	stype = internal,
 	sfunc = numeric_avg_accum,
-	serialtype = internal
-);
-
--- if serialtype is specified we need a serialfunc and deserialfunc
-CREATE AGGREGATE myavg (numeric)
-(
-	stype = internal,
-	sfunc = numeric_avg_accum,
-	serialtype = bytea
-);
-
-CREATE AGGREGATE myavg (numeric)
-(
-	stype = internal,
-	sfunc = numeric_avg_accum,
-	serialtype = bytea,
 	serialfunc = numeric_avg_serialize
 );
 
@@ -146,7 +131,6 @@ CREATE AGGREGATE myavg (numeric)
 (
 	stype = internal,
 	sfunc = numeric_avg_accum,
-	serialtype = bytea,
 	serialfunc = numeric_avg_deserialize,
 	deserialfunc = numeric_avg_deserialize
 );
@@ -156,19 +140,8 @@ CREATE AGGREGATE myavg (numeric)
 (
 	stype = internal,
 	sfunc = numeric_avg_accum,
-	serialtype = bytea,
 	serialfunc = numeric_avg_serialize,
 	deserialfunc = numeric_avg_serialize
-);
-
--- ensure return type of serialfunc is checked
-CREATE AGGREGATE myavg (numeric)
-(
-	stype = internal,
-	sfunc = numeric_avg_accum,
-	serialtype = text,
-	serialfunc = numeric_avg_serialize,
-	deserialfunc = numeric_avg_deserialize
 );
 
 -- ensure combine function parameters are checked
@@ -176,7 +149,6 @@ CREATE AGGREGATE myavg (numeric)
 (
 	stype = internal,
 	sfunc = numeric_avg_accum,
-	serialtype = bytea,
 	serialfunc = numeric_avg_serialize,
 	deserialfunc = numeric_avg_deserialize,
 	combinefunc = int4larger
@@ -188,14 +160,15 @@ CREATE AGGREGATE myavg (numeric)
 	stype = internal,
 	sfunc = numeric_avg_accum,
 	finalfunc = numeric_avg,
-	serialtype = bytea,
 	serialfunc = numeric_avg_serialize,
 	deserialfunc = numeric_avg_deserialize,
-	combinefunc = numeric_avg_combine
+	combinefunc = numeric_avg_combine,
+	finalfunc_modify = shareable  -- just to test a non-default setting
 );
 
 -- Ensure all these functions made it into the catalog
-SELECT aggfnoid,aggtransfn,aggcombinefn,aggtranstype,aggserialfn,aggdeserialfn,aggserialtype
+SELECT aggfnoid, aggtransfn, aggcombinefn, aggtranstype::regtype,
+       aggserialfn, aggdeserialfn, aggfinalmodify
 FROM pg_aggregate
 WHERE aggfnoid = 'myavg'::REGPROC;
 
@@ -237,4 +210,24 @@ CREATE AGGREGATE wrongreturntype (float8)
     mstype = float8,
     msfunc = float8pl,
     minvfunc = float8mi_int
+);
+
+-- invalid: non-lowercase quoted identifiers
+
+CREATE AGGREGATE case_agg ( -- old syntax
+	"Sfunc1" = int4pl,
+	"Basetype" = int4,
+	"Stype1" = int4,
+	"Initcond1" = '0',
+	"Parallel" = safe
+);
+
+CREATE AGGREGATE case_agg(float8)
+(
+	"Stype" = internal,
+	"Sfunc" = ordered_set_transition,
+	"Finalfunc" = percentile_disc_final,
+	"Finalfunc_extra" = true,
+	"Finalfunc_modify" = read_write,
+	"Parallel" = safe
 );

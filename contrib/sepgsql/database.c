@@ -4,7 +4,7 @@
  *
  * Routines corresponding to database objects
  *
- * Copyright (c) 2010-2016, PostgreSQL Global Development Group
+ * Copyright (c) 2010-2018, PostgreSQL Global Development Group
  *
  * -------------------------------------------------------------------------
  */
@@ -80,7 +80,7 @@ sepgsql_database_post_create(Oid databaseId, const char *dtemplate)
 	rel = heap_open(DatabaseRelationId, AccessShareLock);
 
 	ScanKeyInit(&skey,
-				ObjectIdAttributeNumber,
+				Anum_pg_database_oid,
 				BTEqualStrategyNumber, F_OIDEQ,
 				ObjectIdGetDatum(databaseId));
 
@@ -88,7 +88,7 @@ sepgsql_database_post_create(Oid databaseId, const char *dtemplate)
 							   SnapshotSelf, 1, &skey);
 	tuple = systable_getnext(sscan);
 	if (!HeapTupleIsValid(tuple))
-		elog(ERROR, "catalog lookup failed for database %u", databaseId);
+		elog(ERROR, "could not find tuple for database %u", databaseId);
 
 	datForm = (Form_pg_database) GETSTRUCT(tuple);
 

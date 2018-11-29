@@ -9,7 +9,7 @@
  * shorn of features like subselects, inheritance, aggregates, grouping,
  * and so on.  (Those are the things planner.c deals with.)
  *
- * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -57,8 +57,6 @@ query_planner(PlannerInfo *root, List *tlist,
 	Query	   *parse = root->parse;
 	List	   *joinlist;
 	RelOptInfo *final_rel;
-	Index		rti;
-	double		total_pages;
 
 	/*
 	 * If the query has an empty join tree, then it's something easy like
@@ -71,14 +69,13 @@ query_planner(PlannerInfo *root, List *tlist,
 
 		/*
 		 * If query allows parallelism in general, check whether the quals are
-		 * parallel-restricted.  There's currently no real benefit to setting
-		 * this flag correctly because we can't yet reference subplans from
-		 * parallel workers.  But that might change someday, so set this
-		 * correctly anyway.
+		 * parallel-restricted.  (We need not check final_rel->reltarget
+		 * because it's empty at this point.  Anything parallel-restricted in
+		 * the query tlist will be dealt with later.)
 		 */
 		if (root->glob->parallelModeOK)
 			final_rel->consider_parallel =
-				!has_parallel_hazard(parse->jointree->quals, false);
+				is_parallel_safe(root, parse->jointree->quals);
 
 		/* The only path for it is a trivial Result path */
 		add_path(final_rel, (Path *)
@@ -115,6 +112,7 @@ query_planner(PlannerInfo *root, List *tlist,
 	root->full_join_clauses = NIL;
 	root->join_info_list = NIL;
 	root->placeholder_list = NIL;
+	root->fkey_list = NIL;
 	root->initial_rels = NIL;
 
 	/*
@@ -123,6 +121,12 @@ query_planner(PlannerInfo *root, List *tlist,
 	 * array for indexing base relations.
 	 */
 	setup_simple_rel_arrays(root);
+
+	/*
+	 * Populate append_rel_array with each AppendRelInfo to allow direct
+	 * lookups by child relid.
+	 */
+	setup_append_rel_array(root);
 
 	/*
 	 * Construct RelOptInfo nodes for all base relations in query, and
@@ -193,9 +197,15 @@ query_planner(PlannerInfo *root, List *tlist,
 	joinlist = remove_useless_joins(root, joinlist);
 
 	/*
+	 * Also, reduce any semijoins with unique inner rels to plain inner joins.
+	 * Likewise, this can't be done until now for lack of needed info.
+	 */
+	reduce_unique_semijoins(root);
+
+	/*
 	 * Now distribute "placeholders" to base rels as needed.  This has to be
 	 * done after join removal because removal could change whether a
-	 * placeholder is evaluatable at a base rel.
+	 * placeholder is evaluable at a base rel.
 	 */
 	add_placeholders_to_base_rels(root);
 
@@ -206,39 +216,18 @@ query_planner(PlannerInfo *root, List *tlist,
 	create_lateral_join_info(root);
 
 	/*
+	 * Match foreign keys to equivalence classes and join quals.  This must be
+	 * done after finalizing equivalence classes, and it's useful to wait till
+	 * after join removal so that we can skip processing foreign keys
+	 * involving removed relations.
+	 */
+	match_foreign_keys_to_quals(root);
+
+	/*
 	 * Look for join OR clauses that we can extract single-relation
 	 * restriction OR clauses from.
 	 */
 	extract_restriction_or_clauses(root);
-
-	/*
-	 * We should now have size estimates for every actual table involved in
-	 * the query, and we also know which if any have been deleted from the
-	 * query by join removal; so we can compute total_table_pages.
-	 *
-	 * Note that appendrels are not double-counted here, even though we don't
-	 * bother to distinguish RelOptInfos for appendrel parents, because the
-	 * parents will still have size zero.
-	 *
-	 * XXX if a table is self-joined, we will count it once per appearance,
-	 * which perhaps is the wrong thing ... but that's not completely clear,
-	 * and detecting self-joins here is difficult, so ignore it for now.
-	 */
-	total_pages = 0;
-	for (rti = 1; rti < root->simple_rel_array_size; rti++)
-	{
-		RelOptInfo *brel = root->simple_rel_array[rti];
-
-		if (brel == NULL)
-			continue;
-
-		Assert(brel->relid == rti);		/* sanity check on array */
-
-		if (brel->reloptkind == RELOPT_BASEREL ||
-			brel->reloptkind == RELOPT_OTHER_MEMBER_REL)
-			total_pages += (double) brel->pages;
-	}
-	root->total_table_pages = total_pages;
 
 	/*
 	 * Ready to do the primary planning.

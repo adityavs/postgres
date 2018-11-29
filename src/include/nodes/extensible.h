@@ -1,10 +1,10 @@
 /*-------------------------------------------------------------------------
  *
  * extensible.h
- *    Definitions for extensible nodes and custom scans
+ *	  Definitions for extensible nodes and custom scans
  *
  *
- * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/nodes/extensible.h
@@ -61,13 +61,13 @@ typedef struct ExtensibleNodeMethods
 {
 	const char *extnodename;
 	Size		node_size;
-	void	  (*nodeCopy)(struct ExtensibleNode *newnode,
-						  const struct ExtensibleNode *oldnode);
-	bool	  (*nodeEqual)(const struct ExtensibleNode *a,
-						   const struct ExtensibleNode *b);
-	void	  (*nodeOut)(struct StringInfoData *str,
-						 const struct ExtensibleNode *node);
-	void	  (*nodeRead)(struct ExtensibleNode *node);
+	void		(*nodeCopy) (struct ExtensibleNode *newnode,
+							 const struct ExtensibleNode *oldnode);
+	bool		(*nodeEqual) (const struct ExtensibleNode *a,
+							  const struct ExtensibleNode *b);
+	void		(*nodeOut) (struct StringInfoData *str,
+							const struct ExtensibleNode *node);
+	void		(*nodeRead) (struct ExtensibleNode *node);
 } ExtensibleNodeMethods;
 
 extern void RegisterExtensibleNodeMethods(const ExtensibleNodeMethods *method);
@@ -96,7 +96,10 @@ typedef struct CustomPathMethods
 									List *tlist,
 									List *clauses,
 									List *custom_plans);
-} CustomPathMethods;
+	struct List *(*ReparameterizeCustomPathByChild) (PlannerInfo *root,
+													 List *custom_private,
+													 RelOptInfo *child_rel);
+}			CustomPathMethods;
 
 /*
  * Custom scan.  Here again, there's not much to do: we need to be able to
@@ -136,9 +139,13 @@ typedef struct CustomExecMethods
 	void		(*InitializeDSMCustomScan) (CustomScanState *node,
 											ParallelContext *pcxt,
 											void *coordinate);
+	void		(*ReInitializeDSMCustomScan) (CustomScanState *node,
+											  ParallelContext *pcxt,
+											  void *coordinate);
 	void		(*InitializeWorkerCustomScan) (CustomScanState *node,
 											   shm_toc *toc,
 											   void *coordinate);
+	void		(*ShutdownCustomScan) (CustomScanState *node);
 
 	/* Optional: print additional information in EXPLAIN */
 	void		(*ExplainCustomScan) (CustomScanState *node,
@@ -148,6 +155,6 @@ typedef struct CustomExecMethods
 
 extern void RegisterCustomScanMethods(const CustomScanMethods *methods);
 extern const CustomScanMethods *GetCustomScanMethods(const char *CustomName,
-													 bool missing_ok);
+					 bool missing_ok);
 
-#endif	/* EXTENSIBLE_H */
+#endif							/* EXTENSIBLE_H */

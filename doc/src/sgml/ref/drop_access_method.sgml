@@ -32,9 +32,6 @@ DROP ACCESS METHOD [ IF EXISTS ] <replaceable class="parameter">name</replaceabl
    <command>DROP ACCESS METHOD</command> removes an existing access method.
    Only superusers can drop access methods.
   </para>
-
-  <para>
-  </para>
  </refsect1>
 
  <refsect1>
@@ -65,7 +62,9 @@ DROP ACCESS METHOD [ IF EXISTS ] <replaceable class="parameter">name</replaceabl
     <listitem>
      <para>
       Automatically drop objects that depend on the access method
-      (such as operator classes, operator families, indexes).
+      (such as operator classes, operator families, and indexes),
+      and in turn all objects that depend on those objects
+      (see <xref linkend="ddl-depend"/>).
      </para>
     </listitem>
    </varlistentry>
@@ -86,7 +85,7 @@ DROP ACCESS METHOD [ IF EXISTS ] <replaceable class="parameter">name</replaceabl
   <title>Examples</title>
 
   <para>
-   Drop the access method <literal>heptree</>:
+   Drop the access method <literal>heptree</literal>:
 <programlisting>
 DROP ACCESS METHOD heptree;
 </programlisting></para>
@@ -97,7 +96,7 @@ DROP ACCESS METHOD heptree;
 
   <para>
    <command>DROP ACCESS METHOD</command> is a
-   <productname>PostgreSQL</> extension.
+   <productname>PostgreSQL</productname> extension.
   </para>
  </refsect1>
 
@@ -105,7 +104,7 @@ DROP ACCESS METHOD heptree;
   <title>See Also</title>
 
   <simplelist type="inline">
-   <member><xref linkend="sql-create-access-method"></member>
+   <member><xref linkend="sql-create-access-method"/></member>
   </simplelist>
  </refsect1>
 

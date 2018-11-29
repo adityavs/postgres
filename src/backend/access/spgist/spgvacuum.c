@@ -4,7 +4,7 @@
  *	  vacuum for SP-GiST
  *
  *
- * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -17,6 +17,7 @@
 
 #include "access/genam.h"
 #include "access/spgist_private.h"
+#include "access/spgxlog.h"
 #include "access/transam.h"
 #include "access/xloginsert.h"
 #include "catalog/storage_xlog.h"
@@ -33,7 +34,7 @@ typedef struct spgVacPendingItem
 {
 	ItemPointerData tid;		/* redirection target to visit */
 	bool		done;			/* have we dealt with this? */
-	struct spgVacPendingItem *next;		/* list link */
+	struct spgVacPendingItem *next; /* list link */
 } spgVacPendingItem;
 
 /* Local state for vacuum operations */
@@ -47,7 +48,7 @@ typedef struct spgBulkDeleteState
 
 	/* Additional working state */
 	SpGistState spgstate;		/* for SPGiST operations that need one */
-	spgVacPendingItem *pendingList;		/* TIDs we need to (re)visit */
+	spgVacPendingItem *pendingList; /* TIDs we need to (re)visit */
 	TransactionId myXmin;		/* for detecting newly-added redirects */
 	BlockNumber lastFilledBlock;	/* last non-deletable block */
 } spgBulkDeleteState;
@@ -125,8 +126,7 @@ static void
 vacuumLeafPage(spgBulkDeleteState *bds, Relation index, Buffer buffer,
 			   bool forPending)
 {
-	Page		page = BufferGetPage(buffer, NULL, NULL,
-									 BGP_NO_SNAPSHOT_TEST);
+	Page		page = BufferGetPage(buffer);
 	spgxlogVacuumLeaf xlrec;
 	OffsetNumber toDead[MaxIndexTuplesPerPage];
 	OffsetNumber toPlaceholder[MaxIndexTuplesPerPage];
@@ -406,8 +406,7 @@ vacuumLeafPage(spgBulkDeleteState *bds, Relation index, Buffer buffer,
 static void
 vacuumLeafRoot(spgBulkDeleteState *bds, Relation index, Buffer buffer)
 {
-	Page		page = BufferGetPage(buffer, NULL, NULL,
-									 BGP_NO_SNAPSHOT_TEST);
+	Page		page = BufferGetPage(buffer);
 	spgxlogVacuumRoot xlrec;
 	OffsetNumber toDelete[MaxIndexTuplesPerPage];
 	OffsetNumber i,
@@ -492,8 +491,7 @@ vacuumLeafRoot(spgBulkDeleteState *bds, Relation index, Buffer buffer)
 static void
 vacuumRedirectAndPlaceholder(Relation index, Buffer buffer)
 {
-	Page		page = BufferGetPage(buffer, NULL, NULL,
-									 BGP_NO_SNAPSHOT_TEST);
+	Page		page = BufferGetPage(buffer);
 	SpGistPageOpaque opaque = SpGistPageGetOpaque(page);
 	OffsetNumber i,
 				max = PageGetMaxOffsetNumber(page),
@@ -618,7 +616,7 @@ spgvacuumpage(spgBulkDeleteState *bds, BlockNumber blkno)
 	buffer = ReadBufferExtended(index, MAIN_FORKNUM, blkno,
 								RBM_NORMAL, bds->info->strategy);
 	LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
-	page = BufferGetPage(buffer, NULL, NULL, BGP_NO_SNAPSHOT_TEST);
+	page = (Page) BufferGetPage(buffer);
 
 	if (PageIsNew(page))
 	{
@@ -699,7 +697,7 @@ spgprocesspending(spgBulkDeleteState *bds)
 		buffer = ReadBufferExtended(index, MAIN_FORKNUM, blkno,
 									RBM_NORMAL, bds->info->strategy);
 		LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
-		page = BufferGetPage(buffer, NULL, NULL, BGP_NO_SNAPSHOT_TEST);
+		page = (Page) BufferGetPage(buffer);
 
 		if (PageIsNew(page) || SpGistPageIsDeleted(page))
 		{
@@ -752,7 +750,7 @@ spgprocesspending(spgBulkDeleteState *bds)
 
 					offset = ItemPointerGetOffsetNumber(&nitem->tid);
 					innerTuple = (SpGistInnerTuple) PageGetItem(page,
-												PageGetItemId(page, offset));
+																PageGetItemId(page, offset));
 					if (innerTuple->tupstate == SPGIST_LIVE)
 					{
 						SpGistNodeTuple node;
@@ -768,7 +766,7 @@ spgprocesspending(spgBulkDeleteState *bds)
 					{
 						/* transfer attention to redirect point */
 						spgAddPendingTID(bds,
-								   &((SpGistDeadTuple) innerTuple)->pointer);
+										 &((SpGistDeadTuple) innerTuple)->pointer);
 					}
 					else
 						elog(ERROR, "unexpected SPGiST tuple state: %d",
@@ -848,6 +846,21 @@ spgvacuumscan(spgBulkDeleteState *bds)
 	SpGistUpdateMetaPage(index);
 
 	/*
+	 * If we found any empty pages (and recorded them in the FSM), then
+	 * forcibly update the upper-level FSM pages to ensure that searchers can
+	 * find them.  It's possible that the pages were also found during
+	 * previous scans and so this is a waste of time, but it's cheap enough
+	 * relative to scanning the index that it shouldn't matter much, and
+	 * making sure that free pages are available sooner not later seems
+	 * worthwhile.
+	 *
+	 * Note that if no empty pages exist, we don't bother vacuuming the FSM at
+	 * all.
+	 */
+	if (bds->stats->pages_deleted > 0)
+		IndexFreeSpaceMapVacuum(index);
+
+	/*
 	 * Truncate index if possible
 	 *
 	 * XXX disabled because it's unsafe due to possible concurrent inserts.
@@ -918,7 +931,6 @@ dummy_callback(ItemPointer itemptr, void *state)
 IndexBulkDeleteResult *
 spgvacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 {
-	Relation	index = info->index;
 	spgBulkDeleteState bds;
 
 	/* No-op in ANALYZE ONLY mode */
@@ -928,8 +940,8 @@ spgvacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 	/*
 	 * We don't need to scan the index if there was a preceding bulkdelete
 	 * pass.  Otherwise, make a pass that won't delete any live tuples, but
-	 * might still accomplish useful stuff with redirect/placeholder cleanup,
-	 * and in any case will provide stats.
+	 * might still accomplish useful stuff with redirect/placeholder cleanup
+	 * and/or FSM housekeeping, and in any case will provide stats.
 	 */
 	if (stats == NULL)
 	{
@@ -941,9 +953,6 @@ spgvacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 
 		spgvacuumscan(&bds);
 	}
-
-	/* Finally, vacuum the FSM */
-	IndexFreeSpaceMapVacuum(index);
 
 	/*
 	 * It's quite possible for us to be fooled by concurrent tuple moves into

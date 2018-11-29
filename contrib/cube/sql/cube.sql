@@ -4,6 +4,11 @@
 
 CREATE EXTENSION cube;
 
+-- Check whether any of our opclasses fail amvalidate
+SELECT amname, opcname
+FROM pg_opclass opc LEFT JOIN pg_am am ON am.oid = opcmethod
+WHERE opc.oid >= 16384 AND NOT amvalidate(opc.oid);
+
 --
 -- testing the input and output functions
 --
@@ -17,34 +22,22 @@ SELECT '.1'::cube AS cube;
 SELECT '-.1'::cube AS cube;
 SELECT '1.0'::cube AS cube;
 SELECT '-1.0'::cube AS cube;
-SELECT '1e27'::cube AS cube;
-SELECT '-1e27'::cube AS cube;
-SELECT '1.0e27'::cube AS cube;
-SELECT '-1.0e27'::cube AS cube;
-SELECT '1e+27'::cube AS cube;
-SELECT '-1e+27'::cube AS cube;
-SELECT '1.0e+27'::cube AS cube;
-SELECT '-1.0e+27'::cube AS cube;
-SELECT '1e-7'::cube AS cube;
-SELECT '-1e-7'::cube AS cube;
-SELECT '1.0e-7'::cube AS cube;
-SELECT '-1.0e-7'::cube AS cube;
-SELECT '1e-700'::cube AS cube;
-SELECT '-1e-700'::cube AS cube;
-SELECT '1234567890123456'::cube AS cube;
-SELECT '+1234567890123456'::cube AS cube;
-SELECT '-1234567890123456'::cube AS cube;
+SELECT 'infinity'::cube AS cube;
+SELECT '-infinity'::cube AS cube;
+SELECT 'NaN'::cube AS cube;
 SELECT '.1234567890123456'::cube AS cube;
 SELECT '+.1234567890123456'::cube AS cube;
 SELECT '-.1234567890123456'::cube AS cube;
 
 -- simple lists (points)
+SELECT '()'::cube AS cube;
 SELECT '1,2'::cube AS cube;
 SELECT '(1,2)'::cube AS cube;
 SELECT '1,2,3,4,5'::cube AS cube;
 SELECT '(1,2,3,4,5)'::cube AS cube;
 
 -- double lists (cubes)
+SELECT '(),()'::cube AS cube;
 SELECT '(0),(0)'::cube AS cube;
 SELECT '(0),(1)'::cube AS cube;
 SELECT '[(0),(0)]'::cube AS cube;
@@ -57,7 +50,6 @@ SELECT '[(0,0,0,0),(1,0,0,0)]'::cube AS cube;
 -- invalid input: parse errors
 SELECT ''::cube AS cube;
 SELECT 'ABC'::cube AS cube;
-SELECT '()'::cube AS cube;
 SELECT '[]'::cube AS cube;
 SELECT '[()]'::cube AS cube;
 SELECT '[(1)]'::cube AS cube;
@@ -85,6 +77,7 @@ SELECT '1,2ab'::cube AS cube; -- 6
 SELECT '1 e7'::cube AS cube; -- 6
 SELECT '1,2a'::cube AS cube; -- 7
 SELECT '1..2'::cube AS cube; -- 7
+SELECT '-1e-700'::cube AS cube; -- out of range
 
 --
 -- Testing building cubes from float8 values
@@ -115,6 +108,12 @@ SELECT cube_subset(cube('(1,3,5),(6,7,8)'), ARRAY[3,2,1,1]);
 SELECT cube_subset(cube('(1,3,5),(1,3,5)'), ARRAY[3,2,1,1]);
 SELECT cube_subset(cube('(1,3,5),(6,7,8)'), ARRAY[4,0]);
 SELECT cube_subset(cube('(6,7,8),(6,7,8)'), ARRAY[4,0]);
+-- test for limits: this should pass
+SELECT cube_subset(cube('(6,7,8),(6,7,8)'), array(SELECT 1 as a FROM generate_series(1,100)));
+-- and this should fail
+SELECT cube_subset(cube('(6,7,8),(6,7,8)'), array(SELECT 1 as a FROM generate_series(1,101)));
+
+
 
 --
 -- Test point processing
@@ -134,9 +133,21 @@ SELECT cube(cube(1,2), 42, 24); -- cube_c_f8_f8
 --
 -- Testing limit of CUBE_MAX_DIM dimensions check in cube_in.
 --
-
+-- create too big cube from literal
 select '(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)'::cube;
 select '(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0),(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)'::cube;
+-- from an array
+select cube(array(SELECT 0 as a FROM generate_series(1,101)));
+select cube(array(SELECT 0 as a FROM generate_series(1,101)),array(SELECT 0 as a FROM generate_series(1,101)));
+
+-- extend cube beyond limit
+-- this should work
+select cube(array(SELECT 0 as a FROM generate_series(1,100)));
+select cube(array(SELECT 0 as a FROM generate_series(1,100)),array(SELECT 0 as a FROM generate_series(1,100)));
+-- this should fail
+select cube(cube(array(SELECT 0 as a FROM generate_series(1,100))), 0);
+select cube(cube(array(SELECT 0 as a FROM generate_series(1,100)),array(SELECT 0 as a FROM generate_series(1,100))), 0, 0);
+
 
 --
 -- testing the  operators
@@ -246,7 +257,7 @@ SELECT cube_dim('(0,0,0)'::cube);
 SELECT cube_dim('(42,42,42),(42,42,42)'::cube);
 SELECT cube_dim('(4,8,15,16,23),(4,8,15,16,23)'::cube);
 
--- Test of cube_ll_coord function (retrieves LL coodinate values)
+-- Test of cube_ll_coord function (retrieves LL coordinate values)
 --
 SELECT cube_ll_coord('(-1,1),(2,-2)'::cube, 1);
 SELECT cube_ll_coord('(-1,1),(2,-2)'::cube, 2);
@@ -258,7 +269,7 @@ SELECT cube_ll_coord('(42,137)'::cube, 1);
 SELECT cube_ll_coord('(42,137)'::cube, 2);
 SELECT cube_ll_coord('(42,137)'::cube, 3);
 
--- Test of cube_ur_coord function (retrieves UR coodinate values)
+-- Test of cube_ur_coord function (retrieves UR coordinate values)
 --
 SELECT cube_ur_coord('(-1,1),(2,-2)'::cube, 1);
 SELECT cube_ur_coord('(-1,1),(2,-2)'::cube, 2);
@@ -372,20 +383,44 @@ SELECT * FROM test_cube WHERE c && '(3000,1000),(0,0)' ORDER BY c;
 -- Test sorting
 SELECT * FROM test_cube WHERE c && '(3000,1000),(0,0)' GROUP BY c ORDER BY c;
 
--- kNN with index
+-- Test index-only scans
+SET enable_bitmapscan = false;
+EXPLAIN (COSTS OFF)
+SELECT c FROM test_cube WHERE c <@ '(3000,1000),(0,0)' ORDER BY c;
+SELECT c FROM test_cube WHERE c <@ '(3000,1000),(0,0)' ORDER BY c;
+RESET enable_bitmapscan;
+
+-- Test kNN
+INSERT INTO test_cube VALUES ('(1,1)'), ('(100000)'), ('(0, 100000)'); -- Some corner cases
+SET enable_seqscan = false;
+
+-- Test different metrics
 SELECT *, c <-> '(100, 100),(500, 500)'::cube as dist FROM test_cube ORDER BY c <-> '(100, 100),(500, 500)'::cube LIMIT 5;
 SELECT *, c <=> '(100, 100),(500, 500)'::cube as dist FROM test_cube ORDER BY c <=> '(100, 100),(500, 500)'::cube LIMIT 5;
 SELECT *, c <#> '(100, 100),(500, 500)'::cube as dist FROM test_cube ORDER BY c <#> '(100, 100),(500, 500)'::cube LIMIT 5;
 
--- kNN-based sorting
-SELECT * FROM test_cube ORDER BY c~>1 LIMIT 15; -- ascending by 1st coordinate of lower left corner
-SELECT * FROM test_cube ORDER BY c~>4 LIMIT 15; -- ascending by 2nd coordinate or upper right corner
-SELECT * FROM test_cube ORDER BY c~>1 DESC LIMIT 15; -- descending by 1st coordinate of lower left corner
-SELECT * FROM test_cube ORDER BY c~>4 DESC LIMIT 15; -- descending by 2nd coordinate or upper right corner
+-- Test sorting by coordinates
+SELECT c~>1, c FROM test_cube ORDER BY c~>1 LIMIT 15; -- ascending by left bound
+SELECT c~>2, c FROM test_cube ORDER BY c~>2 LIMIT 15; -- ascending by right bound
+SELECT c~>3, c FROM test_cube ORDER BY c~>3 LIMIT 15; -- ascending by lower bound
+SELECT c~>4, c FROM test_cube ORDER BY c~>4 LIMIT 15; -- ascending by upper bound
+SELECT c~>(-1), c FROM test_cube ORDER BY c~>(-1) LIMIT 15; -- descending by left bound
+SELECT c~>(-2), c FROM test_cube ORDER BY c~>(-2) LIMIT 15; -- descending by right bound
+SELECT c~>(-3), c FROM test_cube ORDER BY c~>(-3) LIMIT 15; -- descending by lower bound
+SELECT c~>(-4), c FROM test_cube ORDER BY c~>(-4) LIMIT 15; -- descending by upper bound
 
--- same thing for index with points
-CREATE TABLE test_point(c cube);
-INSERT INTO test_point(SELECT cube(array[c->1,c->2,c->3,c->4]) FROM test_cube);
-CREATE INDEX ON test_point USING gist(c);
-SELECT * FROM test_point ORDER BY c~>1, c~>2 LIMIT 15; -- ascending by 1st then by 2nd coordinate
-SELECT * FROM test_point ORDER BY c~>4 DESC LIMIT 15; -- descending by 1st coordinate
+-- Same queries with sequential scan (should give the same results as above)
+RESET enable_seqscan;
+SET enable_indexscan = OFF;
+SELECT *, c <-> '(100, 100),(500, 500)'::cube as dist FROM test_cube ORDER BY c <-> '(100, 100),(500, 500)'::cube LIMIT 5;
+SELECT *, c <=> '(100, 100),(500, 500)'::cube as dist FROM test_cube ORDER BY c <=> '(100, 100),(500, 500)'::cube LIMIT 5;
+SELECT *, c <#> '(100, 100),(500, 500)'::cube as dist FROM test_cube ORDER BY c <#> '(100, 100),(500, 500)'::cube LIMIT 5;
+SELECT c~>1, c FROM test_cube ORDER BY c~>1 LIMIT 15; -- ascending by left bound
+SELECT c~>2, c FROM test_cube ORDER BY c~>2 LIMIT 15; -- ascending by right bound
+SELECT c~>3, c FROM test_cube ORDER BY c~>3 LIMIT 15; -- ascending by lower bound
+SELECT c~>4, c FROM test_cube ORDER BY c~>4 LIMIT 15; -- ascending by upper bound
+SELECT c~>(-1), c FROM test_cube ORDER BY c~>(-1) LIMIT 15; -- descending by left bound
+SELECT c~>(-2), c FROM test_cube ORDER BY c~>(-2) LIMIT 15; -- descending by right bound
+SELECT c~>(-3), c FROM test_cube ORDER BY c~>(-3) LIMIT 15; -- descending by lower bound
+SELECT c~>(-4), c FROM test_cube ORDER BY c~>(-4) LIMIT 15; -- descending by upper bound
+RESET enable_indexscan;

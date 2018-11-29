@@ -3,7 +3,7 @@
  * postinit.c
  *	  postgres initialization utilities
  *
- * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -21,6 +21,7 @@
 
 #include "access/heapam.h"
 #include "access/htup_details.h"
+#include "access/session.h"
 #include "access/sysattr.h"
 #include "access/xact.h"
 #include "access/xlog.h"
@@ -65,7 +66,7 @@
 static HeapTuple GetDatabaseTuple(const char *dbname);
 static HeapTuple GetDatabaseTupleByOid(Oid dboid);
 static void PerformAuthentication(Port *port);
-static void CheckMyDatabase(const char *name, bool am_superuser);
+static void CheckMyDatabase(const char *name, bool am_superuser, bool override_allow_connections);
 static void InitCommunication(void);
 static void ShutdownPostgres(int code, Datum arg);
 static void StatementTimeoutHandler(void);
@@ -145,7 +146,7 @@ GetDatabaseTupleByOid(Oid dboid)
 	 * form a scan key
 	 */
 	ScanKeyInit(&key[0],
-				ObjectIdAttributeNumber,
+				Anum_pg_database_oid,
 				BTEqualStrategyNumber, F_OIDEQ,
 				ObjectIdGetDatum(dboid));
 
@@ -192,6 +193,7 @@ PerformAuthentication(Port *port)
 	 * FIXME: [fork/exec] Ugh.  Is there a way around this overhead?
 	 */
 #ifdef EXEC_BACKEND
+
 	/*
 	 * load_hba() and load_ident() want to work within the PostmasterContext,
 	 * so create that if it doesn't exist (which it won't).  We'll delete it
@@ -200,9 +202,7 @@ PerformAuthentication(Port *port)
 	if (PostmasterContext == NULL)
 		PostmasterContext = AllocSetContextCreate(TopMemoryContext,
 												  "Postmaster",
-												  ALLOCSET_DEFAULT_MINSIZE,
-												  ALLOCSET_DEFAULT_INITSIZE,
-												  ALLOCSET_DEFAULT_MAXSIZE);
+												  ALLOCSET_DEFAULT_SIZES);
 
 	if (!load_hba())
 	{
@@ -246,37 +246,65 @@ PerformAuthentication(Port *port)
 	{
 		if (am_walsender)
 		{
-#ifdef USE_OPENSSL
+#ifdef USE_SSL
 			if (port->ssl_in_use)
 				ereport(LOG,
-						(errmsg("replication connection authorized: user=%s SSL enabled (protocol=%s, cipher=%s, compression=%s)",
-								port->user_name, SSL_get_version(port->ssl), SSL_get_cipher(port->ssl),
-								SSL_get_current_compression(port->ssl) ? _("on") : _("off"))));
+						(port->application_name != NULL
+						 ? errmsg("replication connection authorized: user=%s application_name=%s SSL enabled (protocol=%s, cipher=%s, bits=%d, compression=%s)",
+								  port->user_name,
+								  port->application_name,
+								  be_tls_get_version(port),
+								  be_tls_get_cipher(port),
+								  be_tls_get_cipher_bits(port),
+								  be_tls_get_compression(port) ? _("on") : _("off"))
+						 : errmsg("replication connection authorized: user=%s SSL enabled (protocol=%s, cipher=%s, bits=%d, compression=%s)",
+								  port->user_name,
+								  be_tls_get_version(port),
+								  be_tls_get_cipher(port),
+								  be_tls_get_cipher_bits(port),
+								  be_tls_get_compression(port) ? _("on") : _("off"))));
 			else
 #endif
 				ereport(LOG,
-						(errmsg("replication connection authorized: user=%s",
-								port->user_name)));
+						(port->application_name != NULL
+						 ? errmsg("replication connection authorized: user=%s application_name=%s",
+								  port->user_name,
+								  port->application_name)
+						 : errmsg("replication connection authorized: user=%s",
+								  port->user_name)));
 		}
 		else
 		{
-#ifdef USE_OPENSSL
+#ifdef USE_SSL
 			if (port->ssl_in_use)
 				ereport(LOG,
-						(errmsg("connection authorized: user=%s database=%s SSL enabled (protocol=%s, cipher=%s, compression=%s)",
-								port->user_name, port->database_name, SSL_get_version(port->ssl), SSL_get_cipher(port->ssl),
-								SSL_get_current_compression(port->ssl) ? _("on") : _("off"))));
+						(port->application_name != NULL
+						 ? errmsg("connection authorized: user=%s database=%s application_name=%s SSL enabled (protocol=%s, cipher=%s, bits=%d, compression=%s)",
+								  port->user_name, port->database_name, port->application_name,
+								  be_tls_get_version(port),
+								  be_tls_get_cipher(port),
+								  be_tls_get_cipher_bits(port),
+								  be_tls_get_compression(port) ? _("on") : _("off"))
+						 : errmsg("connection authorized: user=%s database=%s SSL enabled (protocol=%s, cipher=%s, bits=%d, compression=%s)",
+								  port->user_name, port->database_name,
+								  be_tls_get_version(port),
+								  be_tls_get_cipher(port),
+								  be_tls_get_cipher_bits(port),
+								  be_tls_get_compression(port) ? _("on") : _("off"))));
 			else
 #endif
 				ereport(LOG,
-						(errmsg("connection authorized: user=%s database=%s",
-								port->user_name, port->database_name)));
+						(port->application_name != NULL
+						 ? errmsg("connection authorized: user=%s database=%s application_name=%s",
+								  port->user_name, port->database_name, port->application_name)
+						 : errmsg("connection authorized: user=%s database=%s",
+								  port->user_name, port->database_name)));
 		}
 	}
 
 	set_ps_display("startup", false);
 
-	ClientAuthInProgress = false;		/* client_min_messages is active now */
+	ClientAuthInProgress = false;	/* client_min_messages is active now */
 }
 
 
@@ -284,7 +312,7 @@ PerformAuthentication(Port *port)
  * CheckMyDatabase -- fetch information from the pg_database entry for our DB
  */
 static void
-CheckMyDatabase(const char *name, bool am_superuser)
+CheckMyDatabase(const char *name, bool am_superuser, bool override_allow_connections)
 {
 	HeapTuple	tup;
 	Form_pg_database dbform;
@@ -320,11 +348,11 @@ CheckMyDatabase(const char *name, bool am_superuser)
 		/*
 		 * Check that the database is currently allowing connections.
 		 */
-		if (!dbform->datallowconn)
+		if (!dbform->datallowconn && !override_allow_connections)
 			ereport(FATAL,
 					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-			 errmsg("database \"%s\" is not currently accepting connections",
-					name)));
+					 errmsg("database \"%s\" is not currently accepting connections",
+							name)));
 
 		/*
 		 * Check privilege to connect to the database.  (The am_superuser test
@@ -351,7 +379,7 @@ CheckMyDatabase(const char *name, bool am_superuser)
 		 */
 		if (dbform->datconnlimit >= 0 &&
 			!am_superuser &&
-			CountDBBackends(MyDatabaseId) > dbform->datconnlimit)
+			CountDBConnections(MyDatabaseId) > dbform->datconnlimit)
 			ereport(FATAL,
 					(errcode(ERRCODE_TOO_MANY_CONNECTIONS),
 					 errmsg("too many connections for database \"%s\"",
@@ -376,17 +404,17 @@ CheckMyDatabase(const char *name, bool am_superuser)
 
 	if (pg_perm_setlocale(LC_COLLATE, collate) == NULL)
 		ereport(FATAL,
-			(errmsg("database locale is incompatible with operating system"),
-			 errdetail("The database was initialized with LC_COLLATE \"%s\", "
-					   " which is not recognized by setlocale().", collate),
-			 errhint("Recreate the database with another locale or install the missing locale.")));
+				(errmsg("database locale is incompatible with operating system"),
+				 errdetail("The database was initialized with LC_COLLATE \"%s\", "
+						   " which is not recognized by setlocale().", collate),
+				 errhint("Recreate the database with another locale or install the missing locale.")));
 
 	if (pg_perm_setlocale(LC_CTYPE, ctype) == NULL)
 		ereport(FATAL,
-			(errmsg("database locale is incompatible with operating system"),
-			 errdetail("The database was initialized with LC_CTYPE \"%s\", "
-					   " which is not recognized by setlocale().", ctype),
-			 errhint("Recreate the database with another locale or install the missing locale.")));
+				(errmsg("database locale is incompatible with operating system"),
+				 errdetail("The database was initialized with LC_CTYPE \"%s\", "
+						   " which is not recognized by setlocale().", ctype),
+				 errhint("Recreate the database with another locale or install the missing locale.")));
 
 	/* Make the locale settings visible as GUC variables, too */
 	SetConfigOption("lc_collate", collate, PGC_INTERNAL, PGC_S_OVERRIDE);
@@ -557,7 +585,7 @@ BaseInit(void)
  */
 void
 InitPostgres(const char *in_dbname, Oid dboid, const char *username,
-			 Oid useroid, char *out_dbname)
+			 Oid useroid, char *out_dbname, bool override_allow_connections)
 {
 	bool		bootstrap = IsBootstrapProcessingMode();
 	bool		am_superuser;
@@ -626,8 +654,19 @@ InitPostgres(const char *in_dbname, Oid dboid, const char *username,
 		 * We are either a bootstrap process or a standalone backend. Either
 		 * way, start up the XLOG machinery, and register to have it closed
 		 * down at exit.
+		 *
+		 * We don't yet have an aux-process resource owner, but StartupXLOG
+		 * and ShutdownXLOG will need one.  Hence, create said resource owner
+		 * (and register a callback to clean it up after ShutdownXLOG runs).
 		 */
+		CreateAuxProcessResourceOwner();
+
 		StartupXLOG();
+		/* Release (and warn about) any buffer pins leaked in StartupXLOG */
+		ReleaseAuxProcessResources(true);
+		/* Reset CurrentResourceOwner to nothing for the moment */
+		CurrentResourceOwner = NULL;
+
 		on_shmem_exit(ShutdownXLOG, 0);
 	}
 
@@ -666,7 +705,12 @@ InitPostgres(const char *in_dbname, Oid dboid, const char *username,
 
 	/* The autovacuum launcher is done here */
 	if (IsAutoVacuumLauncherProcess())
+	{
+		/* report this backend in the PgBackendStatus array */
+		pgstat_bestart();
+
 		return;
+	}
 
 	/*
 	 * Start a new transaction here before first access to db, and get a
@@ -753,7 +797,7 @@ InitPostgres(const char *in_dbname, Oid dboid, const char *username,
 		else
 			ereport(FATAL,
 					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-			errmsg("must be superuser to connect during database shutdown")));
+					 errmsg("must be superuser to connect during database shutdown")));
 	}
 
 	/*
@@ -763,11 +807,11 @@ InitPostgres(const char *in_dbname, Oid dboid, const char *username,
 	{
 		ereport(FATAL,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-			 errmsg("must be superuser to connect in binary upgrade mode")));
+				 errmsg("must be superuser to connect in binary upgrade mode")));
 	}
 
 	/*
-	 * The last few connections slots are reserved for superusers. Although
+	 * The last few connection slots are reserved for superusers.  Although
 	 * replication connections currently require superuser privileges, we
 	 * don't allow them to consume the reserved slots, which are intended for
 	 * interactive use.
@@ -841,7 +885,7 @@ InitPostgres(const char *in_dbname, Oid dboid, const char *username,
 					(errcode(ERRCODE_UNDEFINED_DATABASE),
 					 errmsg("database \"%s\" does not exist", in_dbname)));
 		dbform = (Form_pg_database) GETSTRUCT(tuple);
-		MyDatabaseId = HeapTupleGetOid(tuple);
+		MyDatabaseId = dbform->oid;
 		MyDatabaseTableSpace = dbform->dattablespace;
 		/* take database name from the caller, just for paranoia */
 		strlcpy(dbname, in_dbname, sizeof(dbname));
@@ -858,7 +902,7 @@ InitPostgres(const char *in_dbname, Oid dboid, const char *username,
 					(errcode(ERRCODE_UNDEFINED_DATABASE),
 					 errmsg("database %u does not exist", dboid)));
 		dbform = (Form_pg_database) GETSTRUCT(tuple);
-		MyDatabaseId = HeapTupleGetOid(tuple);
+		MyDatabaseId = dbform->oid;
 		MyDatabaseTableSpace = dbform->dattablespace;
 		Assert(MyDatabaseId == dboid);
 		strlcpy(dbname, NameStr(dbform->datname), sizeof(dbname));
@@ -870,12 +914,15 @@ InitPostgres(const char *in_dbname, Oid dboid, const char *username,
 	{
 		/*
 		 * If this is a background worker not bound to any particular
-		 * database, we're done now.  Everything that follows only makes
-		 * sense if we are bound to a specific database.  We do need to
-		 * close the transaction we started before returning.
+		 * database, we're done now.  Everything that follows only makes sense
+		 * if we are bound to a specific database.  We do need to close the
+		 * transaction we started before returning.
 		 */
 		if (!bootstrap)
+		{
+			pgstat_bestart();
 			CommitTransactionCommand();
+		}
 		return;
 	}
 
@@ -937,12 +984,12 @@ InitPostgres(const char *in_dbname, Oid dboid, const char *username,
 
 		tuple = GetDatabaseTuple(dbname);
 		if (!HeapTupleIsValid(tuple) ||
-			MyDatabaseId != HeapTupleGetOid(tuple) ||
+			MyDatabaseId != ((Form_pg_database) GETSTRUCT(tuple))->oid ||
 			MyDatabaseTableSpace != ((Form_pg_database) GETSTRUCT(tuple))->dattablespace)
 			ereport(FATAL,
 					(errcode(ERRCODE_UNDEFINED_DATABASE),
 					 errmsg("database \"%s\" does not exist", dbname),
-			   errdetail("It seems to have just been dropped or renamed.")));
+					 errdetail("It seems to have just been dropped or renamed.")));
 	}
 
 	/*
@@ -960,8 +1007,8 @@ InitPostgres(const char *in_dbname, Oid dboid, const char *username,
 						(errcode(ERRCODE_UNDEFINED_DATABASE),
 						 errmsg("database \"%s\" does not exist",
 								dbname),
-					errdetail("The database subdirectory \"%s\" is missing.",
-							  fullpath)));
+						 errdetail("The database subdirectory \"%s\" is missing.",
+								   fullpath)));
 			else
 				ereport(FATAL,
 						(errcode_for_file_access(),
@@ -992,7 +1039,7 @@ InitPostgres(const char *in_dbname, Oid dboid, const char *username,
 	 * user is a superuser, so the above stuff has to happen first.)
 	 */
 	if (!bootstrap)
-		CheckMyDatabase(dbname, am_superuser);
+		CheckMyDatabase(dbname, am_superuser, override_allow_connections);
 
 	/*
 	 * Now process any command-line switches and any additional GUC variable
@@ -1019,6 +1066,9 @@ InitPostgres(const char *in_dbname, Oid dboid, const char *username,
 
 	/* initialize client encoding */
 	InitializeClientEncoding();
+
+	/* Initialize this backend's session state. */
+	InitializeSession();
 
 	/* report this backend in the PgBackendStatus array */
 	if (!bootstrap)
@@ -1109,7 +1159,7 @@ process_settings(Oid databaseid, Oid roleid)
 
 	relsetting = heap_open(DbRoleSettingRelationId, AccessShareLock);
 
-	/* read all the settings under the same snapsot for efficiency */
+	/* read all the settings under the same snapshot for efficiency */
 	snapshot = RegisterSnapshot(GetCatalogSnapshot(DbRoleSettingRelationId));
 
 	/* Later settings are ignored if set earlier. */

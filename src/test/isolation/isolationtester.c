@@ -7,9 +7,6 @@
 
 #include "postgres_fe.h"
 
-#ifdef WIN32
-#include <windows.h>
-#endif
 #include <sys/time.h>
 #ifdef HAVE_SYS_SELECT_H
 #include <sys/select.h>
@@ -35,6 +32,7 @@ static int	nconns = 0;
 /* In dry run only output permutations to be run by the tester. */
 static int	dry_run = false;
 
+static void exit_nicely(void) pg_attribute_noreturn();
 static void run_testspec(TestSpec *testspec);
 static void run_all_permutations(TestSpec *testspec);
 static void run_all_permutations_recurse(TestSpec *testspec, int nsteps,
@@ -50,6 +48,8 @@ static int	step_qsort_cmp(const void *a, const void *b);
 static int	step_bsearch_cmp(const void *a, const void *b);
 
 static void printResultSet(PGresult *res);
+static void isotesterNoticeProcessor(void *arg, const char *message);
+static void blackholeNoticeProcessor(void *arg, const char *message);
 
 /* close all connections and exit */
 static void
@@ -119,7 +119,7 @@ main(int argc, char **argv)
 	for (i = 0; i < testspec->nsessions; i++)
 		nallsteps += testspec->sessions[i]->nsteps;
 
-	allsteps = malloc(nallsteps * sizeof(Step *));
+	allsteps = pg_malloc(nallsteps * sizeof(Step *));
 
 	n = 0;
 	for (i = 0; i < testspec->nsessions; i++)
@@ -174,6 +174,21 @@ main(int argc, char **argv)
 		}
 
 		/*
+		 * Set up notice processors for the user-defined connections, so that
+		 * messages can get printed prefixed with the session names.  The
+		 * control connection gets a "blackhole" processor instead (hides all
+		 * messages).
+		 */
+		if (i != 0)
+			PQsetNoticeProcessor(conns[i],
+								 isotesterNoticeProcessor,
+								 (void *) (testspec->sessions[i - 1]->name));
+		else
+			PQsetNoticeProcessor(conns[i],
+								 blackholeNoticeProcessor,
+								 NULL);
+
+		/*
 		 * Suppress NOTIFY messages, which otherwise pop into results at odd
 		 * places.
 		 */
@@ -190,7 +205,7 @@ main(int argc, char **argv)
 		if (PQresultStatus(res) == PGRES_TUPLES_OK)
 		{
 			if (PQntuples(res) == 1 && PQnfields(res) == 1)
-				backend_pids[i] = strdup(PQgetvalue(res, 0, 0));
+				backend_pids[i] = pg_strdup(PQgetvalue(res, 0, 0));
 			else
 			{
 				fprintf(stderr, "backend pid query returned %d rows and %d columns, expected 1 row and 1 column",
@@ -227,12 +242,12 @@ main(int argc, char **argv)
 	 */
 	initPQExpBuffer(&wait_query);
 	appendPQExpBufferStr(&wait_query,
-						 "SELECT pg_catalog.pg_blocking_pids($1) && '{");
+						 "SELECT pg_catalog.pg_isolation_test_session_is_blocked($1, '{");
 	/* The spec syntax requires at least one session; assume that here. */
 	appendPQExpBufferStr(&wait_query, backend_pids[1]);
 	for (i = 2; i < nconns; i++)
 		appendPQExpBuffer(&wait_query, ",%s", backend_pids[i]);
-	appendPQExpBufferStr(&wait_query, "}'::integer[]");
+	appendPQExpBufferStr(&wait_query, "}')");
 
 	res = PQprepare(conns[0], PREP_WAITING, wait_query.data, 0, NULL);
 	if (PQresultStatus(res) != PGRES_COMMAND_OK)
@@ -286,7 +301,7 @@ run_all_permutations(TestSpec *testspec)
 	for (i = 0; i < testspec->nsessions; i++)
 		nsteps += testspec->sessions[i]->nsteps;
 
-	steps = malloc(sizeof(Step *) * nsteps);
+	steps = pg_malloc(sizeof(Step *) * nsteps);
 
 	/*
 	 * To generate the permutations, we conceptually put the steps of each
@@ -297,7 +312,7 @@ run_all_permutations(TestSpec *testspec)
 	 * A pile is actually just an integer which tells how many steps we've
 	 * already picked from this pile.
 	 */
-	piles = malloc(sizeof(int) * testspec->nsessions);
+	piles = pg_malloc(sizeof(int) * testspec->nsessions);
 	for (i = 0; i < testspec->nsessions; i++)
 		piles[i] = 0;
 
@@ -345,7 +360,7 @@ run_named_permutations(TestSpec *testspec)
 		Permutation *p = testspec->permutations[i];
 		Step	  **steps;
 
-		steps = malloc(p->nsteps * sizeof(Step *));
+		steps = pg_malloc(p->nsteps * sizeof(Step *));
 
 		/* Find all the named steps using the lookup table */
 		for (j = 0; j < p->nsteps; j++)
@@ -476,8 +491,8 @@ run_permutation(TestSpec *testspec, int nsteps, Step **steps)
 		return;
 	}
 
-	waiting = malloc(sizeof(Step *) * testspec->nsessions);
-	errorstep = malloc(sizeof(Step *) * testspec->nsessions);
+	waiting = pg_malloc(sizeof(Step *) * testspec->nsessions);
+	errorstep = pg_malloc(sizeof(Step *) * testspec->nsessions);
 
 	printf("\nstarting permutation:");
 	for (i = 0; i < nsteps; i++)
@@ -554,8 +569,8 @@ run_permutation(TestSpec *testspec, int nsteps, Step **steps)
 
 				/* Remove that step from the waiting[] array. */
 				if (w + 1 < nwaiting)
-					memcpy(&waiting[w], &waiting[w + 1],
-						   (nwaiting - (w + 1)) * sizeof(Step *));
+					memmove(&waiting[w], &waiting[w + 1],
+							(nwaiting - (w + 1)) * sizeof(Step *));
 				nwaiting--;
 
 				break;
@@ -582,8 +597,8 @@ run_permutation(TestSpec *testspec, int nsteps, Step **steps)
 					/* This one finished, too! */
 					errorstep[nerrorstep++] = waiting[w];
 					if (w + 1 < nwaiting)
-						memcpy(&waiting[w], &waiting[w + 1],
-							   (nwaiting - (w + 1)) * sizeof(Step *));
+						memmove(&waiting[w], &waiting[w + 1],
+								(nwaiting - (w + 1)) * sizeof(Step *));
 					nwaiting--;
 				}
 			}
@@ -596,7 +611,7 @@ run_permutation(TestSpec *testspec, int nsteps, Step **steps)
 		if (!PQsendQuery(conn, step->sql))
 		{
 			fprintf(stdout, "failed to send query for step %s: %s\n",
-					step->name, PQerrorMessage(conns[1 + step->session]));
+					step->name, PQerrorMessage(conn));
 			exit_nicely();
 		}
 
@@ -614,8 +629,8 @@ run_permutation(TestSpec *testspec, int nsteps, Step **steps)
 			{
 				errorstep[nerrorstep++] = waiting[w];
 				if (w + 1 < nwaiting)
-					memcpy(&waiting[w], &waiting[w + 1],
-						   (nwaiting - (w + 1)) * sizeof(Step *));
+					memmove(&waiting[w], &waiting[w + 1],
+							(nwaiting - (w + 1)) * sizeof(Step *));
 				nwaiting--;
 			}
 		}
@@ -745,7 +760,7 @@ try_complete_step(Step *step, int flags)
 					PQntuples(res) != 1)
 				{
 					fprintf(stderr, "lock wait query failed: %s",
-							PQerrorMessage(conn));
+							PQerrorMessage(conns[0]));
 					exit_nicely();
 				}
 				waiting = ((PQgetvalue(res, 0, 0))[0] == 't');
@@ -844,7 +859,7 @@ try_complete_step(Step *step, int flags)
 					const char *sev = PQresultErrorField(res,
 														 PG_DIAG_SEVERITY);
 					const char *msg = PQresultErrorField(res,
-													PG_DIAG_MESSAGE_PRIMARY);
+														 PG_DIAG_MESSAGE_PRIMARY);
 
 					if (sev && msg)
 						step->errormsg = psprintf("%s:  %s", sev, msg);
@@ -882,4 +897,18 @@ printResultSet(PGresult *res)
 			printf("%-15s", PQgetvalue(res, i, j));
 		printf("\n");
 	}
+}
+
+/* notice processor, prefixes each message with the session name */
+static void
+isotesterNoticeProcessor(void *arg, const char *message)
+{
+	fprintf(stderr, "%s: %s", (char *) arg, message);
+}
+
+/* notice processor, hides the message */
+static void
+blackholeNoticeProcessor(void *arg, const char *message)
+{
+	/* do nothing */
 }

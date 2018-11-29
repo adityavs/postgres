@@ -3,7 +3,7 @@
  * pruneheap.c
  *	  heap page pruning and HOT-chain management code
  *
- * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -31,8 +31,7 @@
 typedef struct
 {
 	TransactionId new_prune_xid;	/* new prune hint value for page */
-	TransactionId latestRemovedXid;		/* latest xid to be removed by this
-										 * prune */
+	TransactionId latestRemovedXid; /* latest xid to be removed by this prune */
 	int			nredirected;	/* numbers of entries in arrays below */
 	int			ndead;
 	int			nunused;
@@ -40,7 +39,7 @@ typedef struct
 	OffsetNumber redirected[MaxHeapTuplesPerPage * 2];
 	OffsetNumber nowdead[MaxHeapTuplesPerPage];
 	OffsetNumber nowunused[MaxHeapTuplesPerPage];
-	/* marked[i] is TRUE if item i is entered in one of the above arrays */
+	/* marked[i] is true if item i is entered in one of the above arrays */
 	bool		marked[MaxHeapTuplesPerPage + 1];
 } PruneState;
 
@@ -74,7 +73,7 @@ static void heap_prune_record_unused(PruneState *prstate, OffsetNumber offnum);
 void
 heap_page_prune_opt(Relation relation, Buffer buffer)
 {
-	Page		page = BufferGetPage(buffer, NULL, NULL, BGP_NO_SNAPSHOT_TEST);
+	Page		page = BufferGetPage(buffer);
 	Size		minfree;
 	TransactionId OldestXmin;
 
@@ -105,8 +104,8 @@ heap_page_prune_opt(Relation relation, Buffer buffer)
 		OldestXmin = RecentGlobalXmin;
 	else
 		OldestXmin =
-				TransactionIdLimitedForOldSnapshots(RecentGlobalDataXmin,
-													relation);
+			TransactionIdLimitedForOldSnapshots(RecentGlobalDataXmin,
+												relation);
 
 	Assert(TransactionIdIsValid(OldestXmin));
 
@@ -149,8 +148,8 @@ heap_page_prune_opt(Relation relation, Buffer buffer)
 		 */
 		if (PageIsFull(page) || PageGetHeapFreeSpace(page) < minfree)
 		{
-			TransactionId ignore = InvalidTransactionId;		/* return value not
-																 * needed */
+			TransactionId ignore = InvalidTransactionId;	/* return value not
+															 * needed */
 
 			/* OK to prune */
 			(void) heap_page_prune(relation, buffer, OldestXmin, true, &ignore);
@@ -171,7 +170,7 @@ heap_page_prune_opt(Relation relation, Buffer buffer)
  * or RECENTLY_DEAD (see HeapTupleSatisfiesVacuum).
  *
  * If report_stats is true then we send the number of reclaimed heap-only
- * tuples to pgstats.  (This must be FALSE during vacuum, since vacuum will
+ * tuples to pgstats.  (This must be false during vacuum, since vacuum will
  * send its own new total to pgstats, and we don't want this delta applied
  * on top of that.)
  *
@@ -183,7 +182,7 @@ heap_page_prune(Relation relation, Buffer buffer, TransactionId OldestXmin,
 				bool report_stats, TransactionId *latestRemovedXid)
 {
 	int			ndeleted = 0;
-	Page		page = BufferGetPage(buffer, NULL, NULL, BGP_NO_SNAPSHOT_TEST);
+	Page		page = BufferGetPage(buffer);
 	OffsetNumber offnum,
 				maxoff;
 	PruneState	prstate;
@@ -270,8 +269,7 @@ heap_page_prune(Relation relation, Buffer buffer, TransactionId OldestXmin,
 									prstate.nowunused, prstate.nunused,
 									prstate.latestRemovedXid);
 
-			PageSetLSN(BufferGetPage(buffer, NULL, NULL,
-									 BGP_NO_SNAPSHOT_TEST), recptr);
+			PageSetLSN(BufferGetPage(buffer), recptr);
 		}
 	}
 	else
@@ -357,7 +355,7 @@ heap_prune_chain(Relation relation, Buffer buffer, OffsetNumber rootoffnum,
 				 PruneState *prstate)
 {
 	int			ndeleted = 0;
-	Page		dp = BufferGetPage(buffer, NULL, NULL, BGP_NO_SNAPSHOT_TEST);
+	Page		dp = (Page) BufferGetPage(buffer);
 	TransactionId priorXmax = InvalidTransactionId;
 	ItemId		rootlp;
 	HeapTupleHeader htup;
@@ -409,7 +407,7 @@ heap_prune_chain(Relation relation, Buffer buffer, OffsetNumber rootoffnum,
 			{
 				heap_prune_record_unused(prstate, rootoffnum);
 				HeapTupleHeaderAdvanceLatestRemovedXid(htup,
-												 &prstate->latestRemovedXid);
+													   &prstate->latestRemovedXid);
 				ndeleted++;
 			}
 
@@ -542,7 +540,7 @@ heap_prune_chain(Relation relation, Buffer buffer, OffsetNumber rootoffnum,
 		{
 			latestdead = offnum;
 			HeapTupleHeaderAdvanceLatestRemovedXid(htup,
-												 &prstate->latestRemovedXid);
+												   &prstate->latestRemovedXid);
 		}
 		else if (!recent_dead)
 			break;
@@ -553,6 +551,9 @@ heap_prune_chain(Relation relation, Buffer buffer, OffsetNumber rootoffnum,
 		 */
 		if (!HeapTupleHeaderIsHotUpdated(htup))
 			break;
+
+		/* HOT implies it can't have moved to different partition */
+		Assert(!HeapTupleHeaderIndicatesMovedPartitions(htup));
 
 		/*
 		 * Advance to next chain member.
@@ -683,8 +684,7 @@ heap_page_prune_execute(Buffer buffer,
 						OffsetNumber *nowdead, int ndead,
 						OffsetNumber *nowunused, int nunused)
 {
-	Page		page = BufferGetPage(buffer, NULL, NULL,
-									 BGP_NO_SNAPSHOT_TEST);
+	Page		page = (Page) BufferGetPage(buffer);
 	OffsetNumber *offnum;
 	int			i;
 
@@ -825,6 +825,9 @@ heap_get_root_tuples(Page page, OffsetNumber *root_offsets)
 			/* Advance to next chain member, if any */
 			if (!HeapTupleHeaderIsHotUpdated(htup))
 				break;
+
+			/* HOT implies it can't have moved to different partition */
+			Assert(!HeapTupleHeaderIndicatesMovedPartitions(htup));
 
 			nextoffnum = ItemPointerGetOffsetNumber(&htup->t_ctid);
 			priorXmax = HeapTupleHeaderGetUpdateXid(htup);

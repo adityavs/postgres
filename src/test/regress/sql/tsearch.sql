@@ -48,10 +48,17 @@ SELECT count(*) FROM test_tsvector WHERE a @@ 'eq|yt';
 SELECT count(*) FROM test_tsvector WHERE a @@ '(eq&yt)|(wr&qh)';
 SELECT count(*) FROM test_tsvector WHERE a @@ '(eq|yt)&(wr|qh)';
 SELECT count(*) FROM test_tsvector WHERE a @@ 'w:*|q:*';
+SELECT count(*) FROM test_tsvector WHERE a @@ any ('{wr,qh}');
+SELECT count(*) FROM test_tsvector WHERE a @@ 'no_such_lexeme';
+SELECT count(*) FROM test_tsvector WHERE a @@ '!no_such_lexeme';
 
 create index wowidx on test_tsvector using gist (a);
 
 SET enable_seqscan=OFF;
+SET enable_indexscan=ON;
+SET enable_bitmapscan=OFF;
+
+explain (costs off) SELECT count(*) FROM test_tsvector WHERE a @@ 'wr|qh';
 
 SELECT count(*) FROM test_tsvector WHERE a @@ 'wr|qh';
 SELECT count(*) FROM test_tsvector WHERE a @@ 'wr&qh';
@@ -61,14 +68,37 @@ SELECT count(*) FROM test_tsvector WHERE a @@ '(eq&yt)|(wr&qh)';
 SELECT count(*) FROM test_tsvector WHERE a @@ '(eq|yt)&(wr|qh)';
 SELECT count(*) FROM test_tsvector WHERE a @@ 'w:*|q:*';
 SELECT count(*) FROM test_tsvector WHERE a @@ any ('{wr,qh}');
+SELECT count(*) FROM test_tsvector WHERE a @@ 'no_such_lexeme';
+SELECT count(*) FROM test_tsvector WHERE a @@ '!no_such_lexeme';
+
+SET enable_indexscan=OFF;
+SET enable_bitmapscan=ON;
+
+explain (costs off) SELECT count(*) FROM test_tsvector WHERE a @@ 'wr|qh';
+
+SELECT count(*) FROM test_tsvector WHERE a @@ 'wr|qh';
+SELECT count(*) FROM test_tsvector WHERE a @@ 'wr&qh';
+SELECT count(*) FROM test_tsvector WHERE a @@ 'eq&yt';
+SELECT count(*) FROM test_tsvector WHERE a @@ 'eq|yt';
+SELECT count(*) FROM test_tsvector WHERE a @@ '(eq&yt)|(wr&qh)';
+SELECT count(*) FROM test_tsvector WHERE a @@ '(eq|yt)&(wr|qh)';
+SELECT count(*) FROM test_tsvector WHERE a @@ 'w:*|q:*';
+SELECT count(*) FROM test_tsvector WHERE a @@ any ('{wr,qh}');
+SELECT count(*) FROM test_tsvector WHERE a @@ 'no_such_lexeme';
+SELECT count(*) FROM test_tsvector WHERE a @@ '!no_such_lexeme';
 
 RESET enable_seqscan;
+RESET enable_indexscan;
+RESET enable_bitmapscan;
 
 DROP INDEX wowidx;
 
 CREATE INDEX wowidx ON test_tsvector USING gin (a);
 
 SET enable_seqscan=OFF;
+-- GIN only supports bitmapscan, so no need to test plain indexscan
+
+explain (costs off) SELECT count(*) FROM test_tsvector WHERE a @@ 'wr|qh';
 
 SELECT count(*) FROM test_tsvector WHERE a @@ 'wr|qh';
 SELECT count(*) FROM test_tsvector WHERE a @@ 'wr&qh';
@@ -78,8 +108,11 @@ SELECT count(*) FROM test_tsvector WHERE a @@ '(eq&yt)|(wr&qh)';
 SELECT count(*) FROM test_tsvector WHERE a @@ '(eq|yt)&(wr|qh)';
 SELECT count(*) FROM test_tsvector WHERE a @@ 'w:*|q:*';
 SELECT count(*) FROM test_tsvector WHERE a @@ any ('{wr,qh}');
+SELECT count(*) FROM test_tsvector WHERE a @@ 'no_such_lexeme';
+SELECT count(*) FROM test_tsvector WHERE a @@ '!no_such_lexeme';
 
 RESET enable_seqscan;
+
 INSERT INTO test_tsvector VALUES ('???', 'DFG:1A,2B,6C,10 FGH');
 SELECT * FROM ts_stat('SELECT a FROM test_tsvector') ORDER BY ndoc DESC, nentry DESC, word LIMIT 10;
 SELECT * FROM ts_stat('SELECT a FROM test_tsvector', 'AB') ORDER BY ndoc DESC, nentry DESC, word;
@@ -112,6 +145,10 @@ SELECT * from ts_debug('english', 'http://www.harewoodsolutions.co.uk/press.aspx
 SELECT * from ts_debug('english', 'http://aew.wer0c.ewr/id?ad=qwe&dw<span>');
 SELECT * from ts_debug('english', 'http://5aew.werc.ewr:8100/?');
 SELECT * from ts_debug('english', '5aew.werc.ewr:8100/?xx');
+SELECT token, alias,
+  dictionaries, dictionaries is null as dnull, array_dims(dictionaries) as ddims,
+  lexemes, lexemes is null as lnull, array_dims(lexemes) as ldims
+from ts_debug('english', 'a title');
 
 -- to_tsquery
 
@@ -130,6 +167,9 @@ SELECT plainto_tsquery('english', 'foo bar') || !!plainto_tsquery('english', 'as
 SELECT plainto_tsquery('english', 'foo bar') && 'asd | fg';
 
 -- Check stop word deletion, a and s are stop-words
+SELECT to_tsquery('english', '!(a & !b) & c');
+SELECT to_tsquery('english', '!(a & !b)');
+
 SELECT to_tsquery('english', '(1 <-> 2) <-> a');
 SELECT to_tsquery('english', '(1 <-> a) <-> 2');
 SELECT to_tsquery('english', '(a <-> 1) <-> 2');
@@ -399,6 +439,8 @@ SELECT COUNT(*) FROM test_tsquery WHERE keyword >  'new & york';
 RESET enable_seqscan;
 
 SELECT ts_rewrite('foo & bar & qq & new & york',  'new & york'::tsquery, 'big & apple | nyc | new & york & city');
+SELECT ts_rewrite(ts_rewrite('new & !york ', 'york', '!jersey'),
+                  'jersey', 'mexico');
 
 SELECT ts_rewrite('moscow', 'SELECT keyword, sample FROM test_tsquery'::text );
 SELECT ts_rewrite('moscow & hotel', 'SELECT keyword, sample FROM test_tsquery'::text );
@@ -413,6 +455,9 @@ SELECT ts_rewrite('1 & (2 <2> 3)', 'SELECT keyword, sample FROM test_tsquery'::t
 SELECT ts_rewrite('5 <-> (1 & (2 <-> 3))', 'SELECT keyword, sample FROM test_tsquery'::text );
 SELECT ts_rewrite('5 <-> (6 | 8)', 'SELECT keyword, sample FROM test_tsquery'::text );
 
+-- Check empty substitution
+SELECT ts_rewrite(to_tsquery('5 & (6 | 5)'), to_tsquery('5'), to_tsquery(''));
+SELECT ts_rewrite(to_tsquery('!5'), to_tsquery('5'), to_tsquery(''));
 
 SELECT keyword FROM test_tsquery WHERE keyword @> 'new';
 SELECT keyword FROM test_tsquery WHERE keyword @> 'moscow';
@@ -438,6 +483,12 @@ SELECT ts_rewrite( query, 'SELECT keyword, sample FROM test_tsquery' ) FROM to_t
 SELECT ts_rewrite( query, 'SELECT keyword, sample FROM test_tsquery' ) FROM to_tsquery('english', 'moscow') AS query;
 SELECT ts_rewrite( query, 'SELECT keyword, sample FROM test_tsquery' ) FROM to_tsquery('english', 'moscow & hotel') AS query;
 SELECT ts_rewrite( query, 'SELECT keyword, sample FROM test_tsquery' ) FROM to_tsquery('english', 'bar &  new & qq & foo & york') AS query;
+
+SELECT ts_rewrite(tsquery_phrase('foo', 'foo'), 'foo', 'bar | baz');
+SELECT to_tsvector('foo bar') @@
+  ts_rewrite(tsquery_phrase('foo', 'foo'), 'foo', 'bar | baz');
+SELECT to_tsvector('bar baz') @@
+  ts_rewrite(tsquery_phrase('foo', 'foo'), 'foo', 'bar | baz');
 
 RESET enable_seqscan;
 
@@ -482,8 +533,102 @@ select * from pendtest where 'ipi:*'::tsquery @@ ts;
 
 --check OP_PHRASE on index
 create temp table phrase_index_test(fts tsvector);
-insert into phrase_index_test values('A fat cat has just eaten a rat.');
+insert into phrase_index_test values ('A fat cat has just eaten a rat.');
+insert into phrase_index_test values (to_tsvector('english', 'A fat cat has just eaten a rat.'));
 create index phrase_index_test_idx on phrase_index_test using gin(fts);
 set enable_seqscan = off;
 select * from phrase_index_test where fts @@ phraseto_tsquery('english', 'fat cat');
 set enable_seqscan = on;
+
+-- test websearch_to_tsquery function
+select websearch_to_tsquery('simple', 'I have a fat:*ABCD cat');
+select websearch_to_tsquery('simple', 'orange:**AABBCCDD');
+select websearch_to_tsquery('simple', 'fat:A!cat:B|rat:C<');
+select websearch_to_tsquery('simple', 'fat:A : cat:B');
+
+select websearch_to_tsquery('simple', 'fat*rat');
+select websearch_to_tsquery('simple', 'fat-rat');
+select websearch_to_tsquery('simple', 'fat_rat');
+
+-- weights are completely ignored
+select websearch_to_tsquery('simple', 'abc : def');
+select websearch_to_tsquery('simple', 'abc:def');
+select websearch_to_tsquery('simple', 'a:::b');
+select websearch_to_tsquery('simple', 'abc:d');
+select websearch_to_tsquery('simple', ':');
+
+-- these operators are ignored
+select websearch_to_tsquery('simple', 'abc & def');
+select websearch_to_tsquery('simple', 'abc | def');
+select websearch_to_tsquery('simple', 'abc <-> def');
+select websearch_to_tsquery('simple', 'abc (pg or class)');
+
+-- NOT is ignored in quotes
+select websearch_to_tsquery('english', 'My brand new smartphone');
+select websearch_to_tsquery('english', 'My brand "new smartphone"');
+select websearch_to_tsquery('english', 'My brand "new -smartphone"');
+
+-- test OR operator
+select websearch_to_tsquery('simple', 'cat or rat');
+select websearch_to_tsquery('simple', 'cat OR rat');
+select websearch_to_tsquery('simple', 'cat "OR" rat');
+select websearch_to_tsquery('simple', 'cat OR');
+select websearch_to_tsquery('simple', 'OR rat');
+select websearch_to_tsquery('simple', '"fat cat OR rat"');
+select websearch_to_tsquery('simple', 'fat (cat OR rat');
+select websearch_to_tsquery('simple', 'or OR or');
+
+-- OR is an operator here ...
+select websearch_to_tsquery('simple', '"fat cat"or"fat rat"');
+select websearch_to_tsquery('simple', 'fat or(rat');
+select websearch_to_tsquery('simple', 'fat or)rat');
+select websearch_to_tsquery('simple', 'fat or&rat');
+select websearch_to_tsquery('simple', 'fat or|rat');
+select websearch_to_tsquery('simple', 'fat or!rat');
+select websearch_to_tsquery('simple', 'fat or<rat');
+select websearch_to_tsquery('simple', 'fat or>rat');
+select websearch_to_tsquery('simple', 'fat or ');
+
+-- ... but not here
+select websearch_to_tsquery('simple', 'abc orange');
+select websearch_to_tsquery('simple', 'abc OR1234');
+select websearch_to_tsquery('simple', 'abc or-abc');
+select websearch_to_tsquery('simple', 'abc OR_abc');
+
+-- test quotes
+select websearch_to_tsquery('english', '"pg_class pg');
+select websearch_to_tsquery('english', 'pg_class pg"');
+select websearch_to_tsquery('english', '"pg_class pg"');
+select websearch_to_tsquery('english', 'abc "pg_class pg"');
+select websearch_to_tsquery('english', '"pg_class pg" def');
+select websearch_to_tsquery('english', 'abc "pg pg_class pg" def');
+select websearch_to_tsquery('english', ' or "pg pg_class pg" or ');
+select websearch_to_tsquery('english', '""pg pg_class pg""');
+select websearch_to_tsquery('english', 'abc """"" def');
+select websearch_to_tsquery('english', 'cat -"fat rat"');
+select websearch_to_tsquery('english', 'cat -"fat rat" cheese');
+select websearch_to_tsquery('english', 'abc "def -"');
+select websearch_to_tsquery('english', 'abc "def :"');
+
+select websearch_to_tsquery('english', '"A fat cat" has just eaten a -rat.');
+select websearch_to_tsquery('english', '"A fat cat" has just eaten OR !rat.');
+select websearch_to_tsquery('english', '"A fat cat" has just (+eaten OR -rat)');
+
+select websearch_to_tsquery('english', 'this is ----fine');
+select websearch_to_tsquery('english', '(()) )))) this ||| is && -fine, "dear friend" OR good');
+select websearch_to_tsquery('english', 'an old <-> cat " is fine &&& too');
+
+select websearch_to_tsquery('english', '"A the" OR just on');
+select websearch_to_tsquery('english', '"a fat cat" ate a rat');
+
+select to_tsvector('english', 'A fat cat ate a rat') @@
+	websearch_to_tsquery('english', '"a fat cat" ate a rat');
+
+select to_tsvector('english', 'A fat grey cat ate a rat') @@
+	websearch_to_tsquery('english', '"a fat cat" ate a rat');
+
+-- cases handled by gettoken_tsvector()
+select websearch_to_tsquery('''');
+select websearch_to_tsquery('''abc''''def''');
+select websearch_to_tsquery('\abc');
+select websearch_to_tsquery('\');

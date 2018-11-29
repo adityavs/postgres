@@ -108,6 +108,12 @@ SELECT '' AS three, f.f1, |/f.f1 AS sqrt_f1
 
 -- power
 SELECT power(float8 '144', float8 '0.5');
+SELECT power(float8 'NaN', float8 '0.5');
+SELECT power(float8 '144', float8 'NaN');
+SELECT power(float8 'NaN', float8 'NaN');
+SELECT power(float8 '-1', float8 'NaN');
+SELECT power(float8 '1', float8 'NaN');
+SELECT power(float8 'NaN', float8 '0');
 
 -- take exp of ln(f.f1)
 SELECT '' AS three, f.f1, exp(ln(f.f1)) AS exp_ln_f1
@@ -168,26 +174,62 @@ INSERT INTO FLOAT8_TBL(f1) VALUES ('-1.2345678901234e-200');
 
 SELECT '' AS five, * FROM FLOAT8_TBL;
 
+-- test edge-case coercions to integer
+SELECT '32767.4'::float8::int2;
+SELECT '32767.6'::float8::int2;
+SELECT '-32768.4'::float8::int2;
+SELECT '-32768.6'::float8::int2;
+SELECT '2147483647.4'::float8::int4;
+SELECT '2147483647.6'::float8::int4;
+SELECT '-2147483648.4'::float8::int4;
+SELECT '-2147483648.6'::float8::int4;
+SELECT '9223372036854773760'::float8::int8;
+SELECT '9223372036854775807'::float8::int8;
+SELECT '-9223372036854775808.5'::float8::int8;
+SELECT '-9223372036854780000'::float8::int8;
+
 -- test exact cases for trigonometric functions in degrees
-SELECT x,
-       CASE WHEN sind(x) IN (-1,-0.5,0,0.5,1) THEN sind(x) END AS sind,
-       CASE WHEN cosd(x) IN (-1,-0.5,0,0.5,1) THEN cosd(x) END AS cosd,
-       CASE WHEN tand(x) IN ('-Infinity'::float8,-1,0,
-                             1,'Infinity'::float8) THEN tand(x) END AS tand,
-       CASE WHEN cotd(x) IN ('-Infinity'::float8,-1,0,
-                             1,'Infinity'::float8) THEN cotd(x) END AS cotd
-FROM generate_series(0, 360, 15) AS t(x);
+SET extra_float_digits = 3;
 
 SELECT x,
-       CASE WHEN asind(x) IN (-90,-30,0,30,90) THEN asind(x) END AS asind,
-       CASE WHEN acosd(x) IN (0,60,90,120,180) THEN acosd(x) END AS acosd,
-       CASE WHEN atand(x) IN (-45,0,45) THEN atand(x) END AS atand
+       sind(x),
+       sind(x) IN (-1,-0.5,0,0.5,1) AS sind_exact
+FROM (VALUES (0), (30), (90), (150), (180),
+      (210), (270), (330), (360)) AS t(x);
+
+SELECT x,
+       cosd(x),
+       cosd(x) IN (-1,-0.5,0,0.5,1) AS cosd_exact
+FROM (VALUES (0), (60), (90), (120), (180),
+      (240), (270), (300), (360)) AS t(x);
+
+SELECT x,
+       tand(x),
+       tand(x) IN ('-Infinity'::float8,-1,0,
+                   1,'Infinity'::float8) AS tand_exact,
+       cotd(x),
+       cotd(x) IN ('-Infinity'::float8,-1,0,
+                   1,'Infinity'::float8) AS cotd_exact
+FROM (VALUES (0), (45), (90), (135), (180),
+      (225), (270), (315), (360)) AS t(x);
+
+SELECT x,
+       asind(x),
+       asind(x) IN (-90,-30,0,30,90) AS asind_exact,
+       acosd(x),
+       acosd(x) IN (0,60,90,120,180) AS acosd_exact
 FROM (VALUES (-1), (-0.5), (0), (0.5), (1)) AS t(x);
 
-SELECT atand('-Infinity'::float8) = -90;
-SELECT atand('Infinity'::float8) = 90;
+SELECT x,
+       atand(x),
+       atand(x) IN (-90,-45,0,45,90) AS atand_exact
+FROM (VALUES ('-Infinity'::float8), (-1), (0), (1),
+      ('Infinity'::float8)) AS t(x);
 
 SELECT x, y,
-       CASE WHEN atan2d(y, x) IN (-90,0,90,180) THEN atan2d(y, x) END AS atan2d
+       atan2d(y, x),
+       atan2d(y, x) IN (-90,0,90,180) AS atan2d_exact
 FROM (SELECT 10*cosd(a), 10*sind(a)
       FROM generate_series(0, 360, 90) AS t(a)) AS t(x,y);
+
+RESET extra_float_digits;

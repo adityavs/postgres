@@ -4,7 +4,7 @@
  *	  POSTGRES error reporting/logging definitions.
  *
  *
- * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/utils/elog.h
@@ -27,9 +27,9 @@
 								 * server log by default. */
 #define LOG_SERVER_ONLY 16		/* Same as LOG for server reporting, but never
 								 * sent to client. */
-#define COMMERROR	LOG_SERVER_ONLY		/* Client communication problems; same
-										 * as LOG for server reporting, but
-										 * never sent to client. */
+#define COMMERROR	LOG_SERVER_ONLY /* Client communication problems; same as
+									 * LOG for server reporting, but never
+									 * sent to client. */
 #define INFO		17			/* Messages specifically requested by user (eg
 								 * VACUUM VERBOSE output); always sent to
 								 * client regardless of client_min_messages,
@@ -70,6 +70,23 @@
 /* SQLSTATE codes for errors are defined in a separate file */
 #include "utils/errcodes.h"
 
+/*
+ * Provide a way to prevent "errno" from being accidentally used inside an
+ * elog() or ereport() invocation.  Since we know that some operating systems
+ * define errno as something involving a function call, we'll put a local
+ * variable of the same name as that function in the local scope to force a
+ * compile error.  On platforms that don't define errno in that way, nothing
+ * happens, so we get no warning ... but we can live with that as long as it
+ * happens on some popular platforms.
+ */
+#if defined(errno) && defined(__linux__)
+#define pg_prevent_errno_in_scope() int __errno_location pg_attribute_unused()
+#elif defined(errno) && (defined(__darwin__) || defined(__freebsd__))
+#define pg_prevent_errno_in_scope() int __error pg_attribute_unused()
+#else
+#define pg_prevent_errno_in_scope()
+#endif
+
 
 /*----------
  * New-style error reporting API: to be used in this way:
@@ -103,6 +120,7 @@
 #ifdef HAVE__BUILTIN_CONSTANT_P
 #define ereport_domain(elevel, domain, rest)	\
 	do { \
+		pg_prevent_errno_in_scope(); \
 		if (errstart(elevel, __FILE__, __LINE__, PG_FUNCNAME_MACRO, domain)) \
 			errfinish rest; \
 		if (__builtin_constant_p(elevel) && (elevel) >= ERROR) \
@@ -112,12 +130,13 @@
 #define ereport_domain(elevel, domain, rest)	\
 	do { \
 		const int elevel_ = (elevel); \
+		pg_prevent_errno_in_scope(); \
 		if (errstart(elevel_, __FILE__, __LINE__, PG_FUNCNAME_MACRO, domain)) \
 			errfinish rest; \
 		if (elevel_ >= ERROR) \
 			pg_unreachable(); \
 	} while(0)
-#endif   /* HAVE__BUILTIN_CONSTANT_P */
+#endif							/* HAVE__BUILTIN_CONSTANT_P */
 
 #define ereport(elevel, rest)	\
 	ereport_domain(elevel, TEXTDOMAIN, rest)
@@ -137,7 +156,7 @@ extern int	errmsg(const char *fmt,...) pg_attribute_printf(1, 2);
 extern int	errmsg_internal(const char *fmt,...) pg_attribute_printf(1, 2);
 
 extern int errmsg_plural(const char *fmt_singular, const char *fmt_plural,
-	unsigned long n,...) pg_attribute_printf(1, 4) pg_attribute_printf(2, 4);
+			  unsigned long n,...) pg_attribute_printf(1, 4) pg_attribute_printf(2, 4);
 
 extern int	errdetail(const char *fmt,...) pg_attribute_printf(1, 2);
 extern int	errdetail_internal(const char *fmt,...) pg_attribute_printf(1, 2);
@@ -146,10 +165,10 @@ extern int	errdetail_log(const char *fmt,...) pg_attribute_printf(1, 2);
 
 extern int errdetail_log_plural(const char *fmt_singular,
 					 const char *fmt_plural,
-	unsigned long n,...) pg_attribute_printf(1, 4) pg_attribute_printf(2, 4);
+					 unsigned long n,...) pg_attribute_printf(1, 4) pg_attribute_printf(2, 4);
 
 extern int errdetail_plural(const char *fmt_singular, const char *fmt_plural,
-	unsigned long n,...) pg_attribute_printf(1, 4) pg_attribute_printf(2, 4);
+				 unsigned long n,...) pg_attribute_printf(1, 4) pg_attribute_printf(2, 4);
 
 extern int	errhint(const char *fmt,...) pg_attribute_printf(1, 2);
 
@@ -188,9 +207,8 @@ extern int	getinternalerrposition(void);
  *		elog(ERROR, "portal \"%s\" not found", stmt->portalname);
  *----------
  */
-#ifdef HAVE__VA_ARGS
 /*
- * If we have variadic macros, we can give the compiler a hint about the
+ * Using variadic macros, we can give the compiler a hint about the
  * call not returning when elevel >= ERROR.  See comments for ereport().
  * Note that historically elog() has called elog_start (which saves errno)
  * before evaluating "elevel", so we preserve that behavior here.
@@ -198,6 +216,7 @@ extern int	getinternalerrposition(void);
 #ifdef HAVE__BUILTIN_CONSTANT_P
 #define elog(elevel, ...)  \
 	do { \
+		pg_prevent_errno_in_scope(); \
 		elog_start(__FILE__, __LINE__, PG_FUNCNAME_MACRO); \
 		elog_finish(elevel, __VA_ARGS__); \
 		if (__builtin_constant_p(elevel) && (elevel) >= ERROR) \
@@ -206,19 +225,16 @@ extern int	getinternalerrposition(void);
 #else							/* !HAVE__BUILTIN_CONSTANT_P */
 #define elog(elevel, ...)  \
 	do { \
-		int		elevel_; \
+		pg_prevent_errno_in_scope(); \
 		elog_start(__FILE__, __LINE__, PG_FUNCNAME_MACRO); \
-		elevel_ = (elevel); \
-		elog_finish(elevel_, __VA_ARGS__); \
-		if (elevel_ >= ERROR) \
-			pg_unreachable(); \
+		{ \
+			const int elevel_ = (elevel); \
+			elog_finish(elevel_, __VA_ARGS__); \
+			if (elevel_ >= ERROR) \
+				pg_unreachable(); \
+		} \
 	} while(0)
-#endif   /* HAVE__BUILTIN_CONSTANT_P */
-#else							/* !HAVE__VA_ARGS */
-#define elog  \
-	elog_start(__FILE__, __LINE__, PG_FUNCNAME_MACRO), \
-	elog_finish
-#endif   /* HAVE__VA_ARGS */
+#endif							/* HAVE__BUILTIN_CONSTANT_P */
 
 extern void elog_start(const char *filename, int lineno, const char *funcname);
 extern void elog_finish(int elevel, const char *fmt,...) pg_attribute_printf(2, 3);
@@ -256,7 +272,7 @@ extern PGDLLIMPORT ErrorContextCallback *error_context_stack;
  *		PG_END_TRY();
  *
  * (The braces are not actually necessary, but are recommended so that
- * pgindent will indent the construct nicely.)  The error recovery code
+ * pgindent will indent the construct nicely.)	The error recovery code
  * can optionally do PG_RE_THROW() to propagate the same error outwards.
  *
  * Note: while the system will correctly propagate any new ereport(ERROR)
@@ -328,8 +344,8 @@ extern PGDLLIMPORT sigjmp_buf *PG_exception_stack;
 typedef struct ErrorData
 {
 	int			elevel;			/* error level */
-	bool		output_to_server;		/* will report to server log? */
-	bool		output_to_client;		/* will report to client? */
+	bool		output_to_server;	/* will report to server log? */
+	bool		output_to_client;	/* will report to client? */
 	bool		show_funcname;	/* true to force funcname inclusion */
 	bool		hide_stmt;		/* true to prevent STATEMENT: inclusion */
 	bool		hide_ctx;		/* true to prevent CONTEXT: inclusion */
@@ -381,7 +397,7 @@ typedef enum
 	PGERROR_TERSE,				/* single-line error messages */
 	PGERROR_DEFAULT,			/* recommended style */
 	PGERROR_VERBOSE				/* all the facts, ma'am */
-}	PGErrorVerbosity;
+}			PGErrorVerbosity;
 
 extern int	Log_error_verbosity;
 extern char *Log_line_prefix;
@@ -412,4 +428,4 @@ extern void set_syslog_parameters(const char *ident, int facility);
  */
 extern void write_stderr(const char *fmt,...) pg_attribute_printf(1, 2);
 
-#endif   /* ELOG_H */
+#endif							/* ELOG_H */

@@ -4,7 +4,7 @@
  *	  vacuuming routines for the postgres GiST index access method.
  *
  *
- * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -32,6 +32,7 @@ gistvacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 	BlockNumber npages,
 				blkno;
 	BlockNumber totFreePages;
+	double		tuplesCount;
 	bool		needLock;
 
 	/* No-op in ANALYZE ONLY mode */
@@ -40,17 +41,7 @@ gistvacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 
 	/* Set up all-zero stats if gistbulkdelete wasn't called */
 	if (stats == NULL)
-	{
 		stats = (IndexBulkDeleteResult *) palloc0(sizeof(IndexBulkDeleteResult));
-		/* use heap's tuple count */
-		stats->num_index_tuples = info->num_heap_tuples;
-		stats->estimated_count = info->estimated_count;
-
-		/*
-		 * XXX the above is wrong if index is partial.  Would it be OK to just
-		 * return NULL, or is there work we must do below?
-		 */
-	}
 
 	/*
 	 * Need lock unless it's local to this backend.
@@ -65,6 +56,7 @@ gistvacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 		UnlockRelationForExtension(rel, ExclusiveLock);
 
 	totFreePages = 0;
+	tuplesCount = 0;
 	for (blkno = GIST_ROOT_BLKNO + 1; blkno < npages; blkno++)
 	{
 		Buffer		buffer;
@@ -75,12 +67,17 @@ gistvacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 		buffer = ReadBufferExtended(rel, MAIN_FORKNUM, blkno, RBM_NORMAL,
 									info->strategy);
 		LockBuffer(buffer, GIST_SHARE);
-		page = BufferGetPage(buffer, NULL, NULL, BGP_NO_SNAPSHOT_TEST);
+		page = (Page) BufferGetPage(buffer);
 
 		if (PageIsNew(page) || GistPageIsDeleted(page))
 		{
 			totFreePages++;
 			RecordFreeIndexPage(rel, blkno);
+		}
+		else if (GistPageIsLeaf(page))
+		{
+			/* count tuples in index (considering only leaf tuples) */
+			tuplesCount += PageGetMaxOffsetNumber(page);
 		}
 		UnlockReleaseBuffer(buffer);
 	}
@@ -95,6 +92,8 @@ gistvacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 	stats->num_pages = RelationGetNumberOfBlocks(rel);
 	if (needLock)
 		UnlockRelationForExtension(rel, ExclusiveLock);
+	stats->num_index_tuples = tuplesCount;
+	stats->estimated_count = false;
 
 	return stats;
 }
@@ -166,7 +165,7 @@ gistbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 									RBM_NORMAL, info->strategy);
 		LockBuffer(buffer, GIST_SHARE);
 		gistcheckpage(rel, buffer);
-		page = BufferGetPage(buffer, NULL, NULL, BGP_NO_SNAPSHOT_TEST);
+		page = (Page) BufferGetPage(buffer);
 
 		if (GistPageIsLeaf(page))
 		{
@@ -176,7 +175,7 @@ gistbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 			LockBuffer(buffer, GIST_UNLOCK);
 			LockBuffer(buffer, GIST_EXCLUSIVE);
 
-			page = BufferGetPage(buffer, NULL, NULL, BGP_NO_SNAPSHOT_TEST);
+			page = (Page) BufferGetPage(buffer);
 			if (stack->blkno == GIST_ROOT_BLKNO && !GistPageIsLeaf(page))
 			{
 				/* only the root can become non-leaf during relock */
@@ -223,7 +222,7 @@ gistbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 				{
 					XLogRecPtr	recptr;
 
-					recptr = gistXLogUpdate(rel->rd_node, buffer,
+					recptr = gistXLogUpdate(buffer,
 											todelete, ntodelete,
 											NULL, 0, InvalidBuffer);
 					PageSetLSN(page, recptr);
@@ -249,7 +248,7 @@ gistbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 
 				ptr = (GistBDItem *) palloc(sizeof(GistBDItem));
 				ptr->blkno = ItemPointerGetBlockNumber(&(idxtuple->t_tid));
-				ptr->parentlsn = PageGetLSN(page);
+				ptr->parentlsn = BufferGetLSNAtomic(buffer);
 				ptr->next = stack->next;
 				stack->next = ptr;
 

@@ -29,6 +29,15 @@ import argparse
 import sys
 import xml.etree.ElementTree as ET
 
+# The ranges of Unicode characters that we consider to be "plain letters".
+# For now we are being conservative by including only Latin and Greek.  This
+# could be extended in future based on feedback from people with relevant
+# language knowledge.
+PLAIN_LETTER_RANGES = ((ord('a'), ord('z')), # Latin lower case
+                       (ord('A'), ord('Z')), # Latin upper case
+                       (0x03b1, 0x03c9),     # GREEK SMALL LETTER ALPHA, GREEK SMALL LETTER OMEGA
+                       (0x0391, 0x03a9))     # GREEK CAPITAL LETTER ALPHA, GREEK CAPITAL LETTER OMEGA
+
 def print_record(codepoint, letter):
     print (unichr(codepoint) + "\t" + letter).encode("UTF-8")
 
@@ -39,33 +48,58 @@ class Codepoint:
         self.combining_ids = combining_ids
 
 def is_plain_letter(codepoint):
-    """Return true if codepoint represents a plain ASCII letter."""
-    return (codepoint.id >= ord('a') and codepoint.id <= ord('z')) or \
-           (codepoint.id >= ord('A') and codepoint.id <= ord('Z'))
+    """Return true if codepoint represents a "plain letter"."""
+    for begin, end in PLAIN_LETTER_RANGES:
+      if codepoint.id >= begin and codepoint.id <= end:
+        return True
+    return False
 
 def is_mark(codepoint):
     """Returns true for diacritical marks (combining codepoints)."""
     return codepoint.general_category in ("Mn", "Me", "Mc")
 
 def is_letter_with_marks(codepoint, table):
-    """Returns true for plain letters combined with one or more marks."""
+    """Returns true for letters combined with one or more marks."""
     # See http://www.unicode.org/reports/tr44/tr44-14.html#General_Category_Values
-    return len(codepoint.combining_ids) > 1 and \
-           is_plain_letter(table[codepoint.combining_ids[0]]) and \
-           all(is_mark(table[i]) for i in codepoint.combining_ids[1:])
+
+    # Letter may have no combining characters, in which case it has
+    # no marks.
+    if len(codepoint.combining_ids) == 1:
+        return False
+
+    # A letter without diacritical marks has none of them.
+    if any(is_mark(table[i]) for i in codepoint.combining_ids[1:]) is False:
+        return False
+
+    # Check if the base letter of this letter has marks.
+    codepoint_base = codepoint.combining_ids[0]
+    if (is_plain_letter(table[codepoint_base]) is False and \
+        is_letter_with_marks(table[codepoint_base], table) is False):
+        return False
+
+    return True
 
 def is_letter(codepoint, table):
     """Return true for letter with or without diacritical marks."""
     return is_plain_letter(codepoint) or is_letter_with_marks(codepoint, table)
 
 def get_plain_letter(codepoint, table):
-    """Return the base codepoint without marks."""
+    """Return the base codepoint without marks. If this codepoint has more
+    than one combining character, do a recursive lookup on the table to
+    find out its plain base letter."""
     if is_letter_with_marks(codepoint, table):
-        return table[codepoint.combining_ids[0]]
+        if len(table[codepoint.combining_ids[0]].combining_ids) > 1:
+            return get_plain_letter(table[codepoint.combining_ids[0]], table)
+        elif is_plain_letter(table[codepoint.combining_ids[0]]):
+            return table[codepoint.combining_ids[0]]
+
+        # Should not come here
+        assert(False)
     elif is_plain_letter(codepoint):
         return codepoint
-    else:
-        raise "mu"
+
+    # Should not come here
+    assert(False)
 
 def is_ligature(codepoint, table):
     """Return true for letters combined with letters."""
@@ -161,7 +195,7 @@ def main(args):
            len(codepoint.combining_ids) > 1:
             if is_letter_with_marks(codepoint, table):
                 charactersSet.add((codepoint.id,
-                             chr(get_plain_letter(codepoint, table).id)))
+                             unichr(get_plain_letter(codepoint, table).id)))
             elif args.noLigaturesExpansion is False and is_ligature(codepoint, table):
                 charactersSet.add((codepoint.id,
                              "".join(unichr(combining_codepoint.id)

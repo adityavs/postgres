@@ -17,7 +17,7 @@
  * scan all the rows anyway.
  *
  *
- * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -89,8 +89,8 @@ preprocess_minmax_aggregates(PlannerInfo *root, List *tlist)
 	if (!parse->hasAggs)
 		return;
 
-	Assert(!parse->setOperations);		/* shouldn't get here if a setop */
-	Assert(parse->rowMarks == NIL);		/* nor if FOR UPDATE */
+	Assert(!parse->setOperations);	/* shouldn't get here if a setop */
+	Assert(parse->rowMarks == NIL); /* nor if FOR UPDATE */
 
 	/*
 	 * Reject unoptimizable cases.
@@ -101,6 +101,14 @@ preprocess_minmax_aggregates(PlannerInfo *root, List *tlist)
 	 */
 	if (parse->groupClause || list_length(parse->groupingSets) > 1 ||
 		parse->hasWindowFuncs)
+		return;
+
+	/*
+	 * Reject if query contains any CTEs; there's no way to build an indexscan
+	 * on one so we couldn't succeed here.  (If the CTEs are unreferenced,
+	 * that's not true, but it doesn't seem worth expending cycles to check.)
+	 */
+	if (parse->cteList)
 		return;
 
 	/*
@@ -195,7 +203,7 @@ preprocess_minmax_aggregates(PlannerInfo *root, List *tlist)
 			SS_make_initplan_output_param(root,
 										  exprType((Node *) mminfo->target),
 										  -1,
-									 exprCollation((Node *) mminfo->target));
+										  exprCollation((Node *) mminfo->target));
 	}
 
 	/*
@@ -205,7 +213,10 @@ preprocess_minmax_aggregates(PlannerInfo *root, List *tlist)
 	 * will likely always win, but we need not assume that here.)
 	 *
 	 * Note: grouping_planner won't have created this upperrel yet, but it's
-	 * fine for us to create it first.
+	 * fine for us to create it first.  We will not have inserted the correct
+	 * consider_parallel value in it, but MinMaxAggPath paths are currently
+	 * never parallel-safe anyway, so that doesn't matter.  Likewise, it
+	 * doesn't matter that we haven't filled FDW-related fields in the rel.
 	 */
 	grouped_rel = fetch_upper_rel(root, UPPERREL_GROUP_AGG, NULL);
 	add_path(grouped_rel, (Path *)
@@ -221,9 +232,9 @@ preprocess_minmax_aggregates(PlannerInfo *root, List *tlist)
  *		that each one is a MIN/MAX aggregate.  If so, build a list of the
  *		distinct aggregate calls in the tree.
  *
- * Returns TRUE if a non-MIN/MAX aggregate is found, FALSE otherwise.
+ * Returns true if a non-MIN/MAX aggregate is found, false otherwise.
  * (This seemingly-backward definition is used because expression_tree_walker
- * aborts the scan on TRUE return, which is what we want.)
+ * aborts the scan on true return, which is what we want.)
  *
  * Found aggregates are added to the list at *context; it's up to the caller
  * to initialize the list to NIL.
@@ -324,8 +335,8 @@ find_minmax_aggs_walker(Node *node, List **context)
  *		Given a MIN/MAX aggregate, try to build an indexscan Path it can be
  *		optimized with.
  *
- * If successful, stash the best path in *mminfo and return TRUE.
- * Otherwise, return FALSE.
+ * If successful, stash the best path in *mminfo and return true.
+ * Otherwise, return false.
  */
 static bool
 build_minmax_path(PlannerInfo *root, MinMaxAggInfo *mminfo,
@@ -357,13 +368,12 @@ build_minmax_path(PlannerInfo *root, MinMaxAggInfo *mminfo,
 	subroot->plan_params = NIL;
 	subroot->outer_params = NULL;
 	subroot->init_plans = NIL;
-	subroot->cte_plan_ids = NIL;
 
-	subroot->parse = parse = (Query *) copyObject(root->parse);
+	subroot->parse = parse = copyObject(root->parse);
 	IncrementVarSublevelsUp((Node *) parse, 1, 1);
 
 	/* append_rel_list might contain outer Vars? */
-	subroot->append_rel_list = (List *) copyObject(root->append_rel_list);
+	subroot->append_rel_list = copyObject(root->append_rel_list);
 	IncrementVarSublevelsUp((Node *) subroot->append_rel_list, 1, 1);
 	/* There shouldn't be any OJ info to translate, as yet */
 	Assert(subroot->join_info_list == NIL);

@@ -4,7 +4,7 @@
  *
  * Routines corresponding to procedure objects
  *
- * Copyright (c) 2010-2016, PostgreSQL Global Development Group
+ * Copyright (c) 2010-2018, PostgreSQL Global Development Group
  *
  * -------------------------------------------------------------------------
  */
@@ -59,7 +59,7 @@ sepgsql_proc_post_create(Oid functionId)
 	rel = heap_open(ProcedureRelationId, AccessShareLock);
 
 	ScanKeyInit(&skey,
-				ObjectIdAttributeNumber,
+				Anum_pg_proc_oid,
 				BTEqualStrategyNumber, F_OIDEQ,
 				ObjectIdGetDatum(functionId));
 
@@ -68,7 +68,7 @@ sepgsql_proc_post_create(Oid functionId)
 
 	tuple = systable_getnext(sscan);
 	if (!HeapTupleIsValid(tuple))
-		elog(ERROR, "catalog lookup failed for proc %u", functionId);
+		elog(ERROR, "could not find tuple for function %u", functionId);
 
 	proForm = (Form_pg_proc) GETSTRUCT(tuple);
 
@@ -106,7 +106,7 @@ sepgsql_proc_post_create(Oid functionId)
 	initStringInfo(&audit_name);
 	nsp_name = get_namespace_name(proForm->pronamespace);
 	appendStringInfo(&audit_name, "%s(",
-			quote_qualified_identifier(nsp_name, NameStr(proForm->proname)));
+					 quote_qualified_identifier(nsp_name, NameStr(proForm->proname)));
 	for (i = 0; i < proForm->pronargs; i++)
 	{
 		if (i > 0)
@@ -253,7 +253,7 @@ sepgsql_proc_setattr(Oid functionId)
 	rel = heap_open(ProcedureRelationId, AccessShareLock);
 
 	ScanKeyInit(&skey,
-				ObjectIdAttributeNumber,
+				Anum_pg_proc_oid,
 				BTEqualStrategyNumber, F_OIDEQ,
 				ObjectIdGetDatum(functionId));
 
@@ -261,7 +261,7 @@ sepgsql_proc_setattr(Oid functionId)
 							   SnapshotSelf, 1, &skey);
 	newtup = systable_getnext(sscan);
 	if (!HeapTupleIsValid(newtup))
-		elog(ERROR, "catalog lookup failed for function %u", functionId);
+		elog(ERROR, "could not find tuple for function %u", functionId);
 	newform = (Form_pg_proc) GETSTRUCT(newtup);
 
 	/*

@@ -4,7 +4,7 @@
  *		Common code for control data file output.
  *
  *
- * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -29,18 +29,24 @@
 #include "port/pg_crc32c.h"
 
 /*
- * get_controlfile(char *DataDir, const char *progname)
+ * get_controlfile(char *DataDir, const char *progname, bool *crc_ok_p)
  *
- * Get controlfile values. The caller is responsible
- * for pfreeing the result.
+ * Get controlfile values.  The result is returned as a palloc'd copy of the
+ * control file data.
+ *
+ * crc_ok_p can be used by the caller to see whether the CRC of the control
+ * file data is correct.
  */
 ControlFileData *
-get_controlfile(char *DataDir, const char *progname)
+get_controlfile(const char *DataDir, const char *progname, bool *crc_ok_p)
 {
-	ControlFileData	   *ControlFile;
-	int					fd;
-	char				ControlFilePath[MAXPGPATH];
-	pg_crc32c			crc;
+	ControlFileData *ControlFile;
+	int			fd;
+	char		ControlFilePath[MAXPGPATH];
+	pg_crc32c	crc;
+	int			r;
+
+	AssertArg(crc_ok_p);
 
 	ControlFile = palloc(sizeof(ControlFileData));
 	snprintf(ControlFilePath, MAXPGPATH, "%s/global/pg_control", DataDir);
@@ -49,8 +55,8 @@ get_controlfile(char *DataDir, const char *progname)
 #ifndef FRONTEND
 		ereport(ERROR,
 				(errcode_for_file_access(),
-				errmsg("could not open file \"%s\" for reading: %m",
-					   ControlFilePath)));
+				 errmsg("could not open file \"%s\" for reading: %m",
+						ControlFilePath)));
 #else
 	{
 		fprintf(stderr, _("%s: could not open file \"%s\" for reading: %s\n"),
@@ -59,36 +65,46 @@ get_controlfile(char *DataDir, const char *progname)
 	}
 #endif
 
-	if (read(fd, ControlFile, sizeof(ControlFileData)) != sizeof(ControlFileData))
-#ifndef FRONTEND
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				errmsg("could not read file \"%s\": %m", ControlFilePath)));
-#else
+	r = read(fd, ControlFile, sizeof(ControlFileData));
+	if (r != sizeof(ControlFileData))
 	{
-		fprintf(stderr, _("%s: could not read file \"%s\": %s\n"),
-				progname, ControlFilePath, strerror(errno));
-		exit(EXIT_FAILURE);
-	}
+		if (r < 0)
+#ifndef FRONTEND
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not read file \"%s\": %m", ControlFilePath)));
+#else
+		{
+			fprintf(stderr, _("%s: could not read file \"%s\": %s\n"),
+					progname, ControlFilePath, strerror(errno));
+			exit(EXIT_FAILURE);
+		}
 #endif
+		else
+#ifndef FRONTEND
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("could not read file \"%s\": read %d of %zu",
+							ControlFilePath, r, sizeof(ControlFileData))));
+#else
+		{
+			fprintf(stderr, _("%s: could not read file \"%s\": read %d of %zu\n"),
+					progname, ControlFilePath, r, sizeof(ControlFileData));
+			exit(EXIT_FAILURE);
+		}
+#endif
+	}
 
 	close(fd);
 
 	/* Check the CRC. */
 	INIT_CRC32C(crc);
 	COMP_CRC32C(crc,
-			   (char *) ControlFile,
-			   offsetof(ControlFileData, crc));
+				(char *) ControlFile,
+				offsetof(ControlFileData, crc));
 	FIN_CRC32C(crc);
 
-	if (!EQ_CRC32C(crc, ControlFile->crc))
-#ifndef FRONTEND
-		elog(ERROR, _("calculated CRC checksum does not match value stored in file"));
-#else
-		printf(_("WARNING: Calculated CRC checksum does not match value stored in file.\n"
-				 "Either the file is corrupt, or it has a different layout than this program\n"
-				 "is expecting.  The results below are untrustworthy.\n\n"));
-#endif
+	*crc_ok_p = EQ_CRC32C(crc, ControlFile->crc);
 
 	/* Make sure the control file is valid byte order. */
 	if (ControlFile->pg_control_version % 65536 == 0 &&

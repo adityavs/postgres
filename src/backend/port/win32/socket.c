@@ -3,7 +3,7 @@
  * socket.c
  *	  Microsoft Windows Win32 Socket Functions
  *
- * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/port/win32/socket.c
@@ -44,22 +44,37 @@ int			pgwin32_noblock = 0;
 
 /*
  * Convert the last socket error code into errno
+ *
+ * Note: where there is a direct correspondence between a WSAxxx error code
+ * and a Berkeley error symbol, this mapping is actually a no-op, because
+ * in win32.h we redefine the network-related Berkeley error symbols to have
+ * the values of their WSAxxx counterparts.  The point of the switch is
+ * mostly to translate near-miss error codes into something that's sensible
+ * in the Berkeley universe.
  */
 static void
 TranslateSocketError(void)
 {
 	switch (WSAGetLastError())
 	{
-		case WSANOTINITIALISED:
-		case WSAENETDOWN:
-		case WSAEINPROGRESS:
 		case WSAEINVAL:
-		case WSAESOCKTNOSUPPORT:
-		case WSAEFAULT:
+		case WSANOTINITIALISED:
 		case WSAEINVALIDPROVIDER:
 		case WSAEINVALIDPROCTABLE:
-		case WSAEMSGSIZE:
+		case WSAEDESTADDRREQ:
 			errno = EINVAL;
+			break;
+		case WSAEINPROGRESS:
+			errno = EINPROGRESS;
+			break;
+		case WSAEFAULT:
+			errno = EFAULT;
+			break;
+		case WSAEISCONN:
+			errno = EISCONN;
+			break;
+		case WSAEMSGSIZE:
+			errno = EMSGSIZE;
 			break;
 		case WSAEAFNOSUPPORT:
 			errno = EAFNOSUPPORT;
@@ -72,16 +87,23 @@ TranslateSocketError(void)
 			break;
 		case WSAEPROTONOSUPPORT:
 		case WSAEPROTOTYPE:
+		case WSAESOCKTNOSUPPORT:
 			errno = EPROTONOSUPPORT;
+			break;
+		case WSAECONNABORTED:
+			errno = ECONNABORTED;
 			break;
 		case WSAECONNREFUSED:
 			errno = ECONNREFUSED;
+			break;
+		case WSAECONNRESET:
+			errno = ECONNRESET;
 			break;
 		case WSAEINTR:
 			errno = EINTR;
 			break;
 		case WSAENOTSOCK:
-			errno = EBADFD;
+			errno = ENOTSOCK;
 			break;
 		case WSAEOPNOTSUPP:
 			errno = EOPNOTSUPP;
@@ -92,13 +114,24 @@ TranslateSocketError(void)
 		case WSAEACCES:
 			errno = EACCES;
 			break;
-		case WSAENOTCONN:
+		case WSAEADDRINUSE:
+			errno = EADDRINUSE;
+			break;
+		case WSAEADDRNOTAVAIL:
+			errno = EADDRNOTAVAIL;
+			break;
+		case WSAEHOSTUNREACH:
+		case WSAEHOSTDOWN:
+		case WSAHOST_NOT_FOUND:
+		case WSAENETDOWN:
+		case WSAENETUNREACH:
 		case WSAENETRESET:
-		case WSAECONNRESET:
+			errno = EHOSTUNREACH;
+			break;
+		case WSAENOTCONN:
 		case WSAESHUTDOWN:
-		case WSAECONNABORTED:
 		case WSAEDISCON:
-			errno = ECONNREFUSED;		/* ENOTCONN? */
+			errno = ENOTCONN;
 			break;
 		default:
 			ereport(NOTICE,
@@ -265,7 +298,7 @@ pgwin32_socket(int af, int type, int protocol)
 }
 
 int
-pgwin32_bind(SOCKET s, struct sockaddr * addr, int *addrlen)
+pgwin32_bind(SOCKET s, struct sockaddr *addr, int addrlen)
 {
 	int			res;
 
@@ -287,7 +320,7 @@ pgwin32_listen(SOCKET s, int backlog)
 }
 
 SOCKET
-pgwin32_accept(SOCKET s, struct sockaddr * addr, int *addrlen)
+pgwin32_accept(SOCKET s, struct sockaddr *addr, int *addrlen)
 {
 	SOCKET		rs;
 
@@ -309,7 +342,7 @@ pgwin32_accept(SOCKET s, struct sockaddr * addr, int *addrlen)
 
 /* No signal delivery during connect. */
 int
-pgwin32_connect(SOCKET s, const struct sockaddr * addr, int addrlen)
+pgwin32_connect(SOCKET s, const struct sockaddr *addr, int addrlen)
 {
 	int			r;
 
@@ -393,7 +426,7 @@ pgwin32_recv(SOCKET s, char *buf, int len, int f)
 		pg_usleep(10000);
 	}
 	ereport(NOTICE,
-	  (errmsg_internal("could not read from ready socket (after retries)")));
+			(errmsg_internal("could not read from ready socket (after retries)")));
 	errno = EWOULDBLOCK;
 	return -1;
 }
@@ -467,7 +500,7 @@ pgwin32_send(SOCKET s, const void *buf, int len, int flags)
  * since it is not used in postgresql!
  */
 int
-pgwin32_select(int nfds, fd_set *readfds, fd_set *writefds, fd_set *exceptfds, const struct timeval * timeout)
+pgwin32_select(int nfds, fd_set *readfds, fd_set *writefds, fd_set *exceptfds, const struct timeval *timeout)
 {
 	WSAEVENT	events[FD_SETSIZE * 2]; /* worst case is readfds totally
 										 * different from writefds, so
@@ -490,11 +523,16 @@ pgwin32_select(int nfds, fd_set *readfds, fd_set *writefds, fd_set *exceptfds, c
 	FD_ZERO(&outwritefds);
 
 	/*
-	 * Write FDs are different in the way that it is only flagged by
-	 * WSASelectEvent() if we have tried to write to them first. So try an
-	 * empty write
+	 * Windows does not guarantee to log an FD_WRITE network event indicating
+	 * that more data can be sent unless the previous send() failed with
+	 * WSAEWOULDBLOCK.  While our caller might well have made such a call, we
+	 * cannot assume that here.  Therefore, if waiting for write-ready, force
+	 * the issue by doing a dummy send().  If the dummy send() succeeds,
+	 * assume that the socket is in fact write-ready, and return immediately.
+	 * Also, if it fails with something other than WSAEWOULDBLOCK, return a
+	 * write-ready indication to let our caller deal with the error condition.
 	 */
-	if (writefds)
+	if (writefds != NULL)
 	{
 		for (i = 0; i < writefds->fd_count; i++)
 		{
@@ -506,20 +544,11 @@ pgwin32_select(int nfds, fd_set *readfds, fd_set *writefds, fd_set *exceptfds, c
 			buf.len = 0;
 
 			r = WSASend(writefds->fd_array[i], &buf, 1, &sent, 0, NULL, NULL);
-			if (r == 0)			/* Completed - means things are fine! */
+			if (r == 0 || WSAGetLastError() != WSAEWOULDBLOCK)
 				FD_SET(writefds->fd_array[i], &outwritefds);
-
-			else
-			{					/* Not completed */
-				if (WSAGetLastError() != WSAEWOULDBLOCK)
-
-					/*
-					 * Not completed, and not just "would block", so an error
-					 * occurred
-					 */
-					FD_SET(writefds->fd_array[i], &outwritefds);
-			}
 		}
+
+		/* If we found any write-ready sockets, just return them immediately */
 		if (outwritefds.fd_count > 0)
 		{
 			memcpy(writefds, &outwritefds, sizeof(fd_set));
@@ -660,40 +689,4 @@ pgwin32_select(int nfds, fd_set *readfds, fd_set *writefds, fd_set *exceptfds, c
 	if (writefds)
 		memcpy(writefds, &outwritefds, sizeof(fd_set));
 	return nummatches;
-}
-
-
-/*
- * Return win32 error string, since strerror can't
- * handle winsock codes
- */
-static char wserrbuf[256];
-const char *
-pgwin32_socket_strerror(int err)
-{
-	static HANDLE handleDLL = INVALID_HANDLE_VALUE;
-
-	if (handleDLL == INVALID_HANDLE_VALUE)
-	{
-		handleDLL = LoadLibraryEx("netmsg.dll", NULL, DONT_RESOLVE_DLL_REFERENCES | LOAD_LIBRARY_AS_DATAFILE);
-		if (handleDLL == NULL)
-			ereport(FATAL,
-					(errmsg_internal("could not load netmsg.dll: error code %lu", GetLastError())));
-	}
-
-	ZeroMemory(&wserrbuf, sizeof(wserrbuf));
-	if (FormatMessage(FORMAT_MESSAGE_IGNORE_INSERTS |
-					  FORMAT_MESSAGE_FROM_SYSTEM |
-					  FORMAT_MESSAGE_FROM_HMODULE,
-					  handleDLL,
-					  err,
-					  MAKELANGID(LANG_ENGLISH, SUBLANG_DEFAULT),
-					  wserrbuf,
-					  sizeof(wserrbuf) - 1,
-					  NULL) == 0)
-	{
-		/* Failed to get id */
-		sprintf(wserrbuf, "unrecognized winsock error %d", err);
-	}
-	return wserrbuf;
 }

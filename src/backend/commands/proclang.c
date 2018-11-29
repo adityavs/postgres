@@ -3,7 +3,7 @@
  * proclang.c
  *	  PostgreSQL PROCEDURAL LANGUAGE support code.
  *
- * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -16,6 +16,7 @@
 #include "access/genam.h"
 #include "access/heapam.h"
 #include "access/htup_details.h"
+#include "catalog/catalog.h"
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
 #include "catalog/objectaccess.h"
@@ -24,7 +25,6 @@
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_pltemplate.h"
 #include "catalog/pg_proc.h"
-#include "catalog/pg_proc_fn.h"
 #include "catalog/pg_type.h"
 #include "commands/dbcommands.h"
 #include "commands/defrem.h"
@@ -97,7 +97,7 @@ CreateProceduralLanguage(CreatePLangStmt *stmt)
 						 errmsg("must be superuser to create procedural language \"%s\"",
 								stmt->plname)));
 			if (!pg_database_ownercheck(MyDatabaseId, GetUserId()))
-				aclcheck_error(ACLCHECK_NOT_OWNER, ACL_KIND_DATABASE,
+				aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_DATABASE,
 							   get_database_name(MyDatabaseId));
 		}
 
@@ -114,8 +114,8 @@ CreateProceduralLanguage(CreatePLangStmt *stmt)
 			if (funcrettype != LANGUAGE_HANDLEROID)
 				ereport(ERROR,
 						(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-				  errmsg("function %s must return type %s",
-						 NameListToString(funcname), "language_handler")));
+						 errmsg("function %s must return type %s",
+								NameListToString(funcname), "language_handler")));
 		}
 		else
 		{
@@ -129,8 +129,7 @@ CreateProceduralLanguage(CreatePLangStmt *stmt)
 									  F_FMGR_C_VALIDATOR,
 									  pltemplate->tmplhandler,
 									  pltemplate->tmpllibrary,
-									  false,	/* isAgg */
-									  false,	/* isWindowFunc */
+									  PROKIND_FUNCTION,
 									  false,	/* security_definer */
 									  false,	/* isLeakProof */
 									  false,	/* isStrict */
@@ -161,18 +160,17 @@ CreateProceduralLanguage(CreatePLangStmt *stmt)
 			{
 				tmpAddr = ProcedureCreate(pltemplate->tmplinline,
 										  PG_CATALOG_NAMESPACE,
-										  false,		/* replace */
-										  false,		/* returnsSet */
+										  false,	/* replace */
+										  false,	/* returnsSet */
 										  VOIDOID,
 										  BOOTSTRAP_SUPERUSERID,
 										  ClanguageId,
 										  F_FMGR_C_VALIDATOR,
 										  pltemplate->tmplinline,
 										  pltemplate->tmpllibrary,
-										  false,		/* isAgg */
-										  false,		/* isWindowFunc */
-										  false,		/* security_definer */
-										  false,		/* isLeakProof */
+										  PROKIND_FUNCTION,
+										  false,	/* security_definer */
+										  false,	/* isLeakProof */
 										  true, /* isStrict */
 										  PROVOLATILE_VOLATILE,
 										  PROPARALLEL_UNSAFE,
@@ -204,18 +202,17 @@ CreateProceduralLanguage(CreatePLangStmt *stmt)
 			{
 				tmpAddr = ProcedureCreate(pltemplate->tmplvalidator,
 										  PG_CATALOG_NAMESPACE,
-										  false,		/* replace */
-										  false,		/* returnsSet */
+										  false,	/* replace */
+										  false,	/* returnsSet */
 										  VOIDOID,
 										  BOOTSTRAP_SUPERUSERID,
 										  ClanguageId,
 										  F_FMGR_C_VALIDATOR,
 										  pltemplate->tmplvalidator,
 										  pltemplate->tmpllibrary,
-										  false,		/* isAgg */
-										  false,		/* isWindowFunc */
-										  false,		/* security_definer */
-										  false,		/* isLeakProof */
+										  PROKIND_FUNCTION,
+										  false,	/* security_definer */
+										  false,	/* isLeakProof */
 										  true, /* isStrict */
 										  PROVOLATILE_VOLATILE,
 										  PROPARALLEL_UNSAFE,
@@ -278,15 +275,16 @@ CreateProceduralLanguage(CreatePLangStmt *stmt)
 			{
 				ereport(WARNING,
 						(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-						 errmsg("changing return type of function %s from \"opaque\" to \"language_handler\"",
-								NameListToString(stmt->plhandler))));
+						 errmsg("changing return type of function %s from %s to %s",
+								NameListToString(stmt->plhandler),
+								"opaque", "language_handler")));
 				SetFunctionReturnType(handlerOid, LANGUAGE_HANDLEROID);
 			}
 			else
 				ereport(ERROR,
 						(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-				  errmsg("function %s must return type %s",
-						 NameListToString(stmt->plhandler), "language_handler")));
+						 errmsg("function %s must return type %s",
+								NameListToString(stmt->plhandler), "language_handler")));
 		}
 
 		/* validate the inline function */
@@ -332,6 +330,7 @@ create_proc_lang(const char *languageName, bool replace,
 	NameData	langname;
 	HeapTuple	oldtup;
 	HeapTuple	tup;
+	Oid			langoid;
 	bool		is_update;
 	ObjectAddress myself,
 				referenced;
@@ -359,39 +358,43 @@ create_proc_lang(const char *languageName, bool replace,
 
 	if (HeapTupleIsValid(oldtup))
 	{
+		Form_pg_language oldform = (Form_pg_language) GETSTRUCT(oldtup);
+
 		/* There is one; okay to replace it? */
 		if (!replace)
 			ereport(ERROR,
 					(errcode(ERRCODE_DUPLICATE_OBJECT),
 					 errmsg("language \"%s\" already exists", languageName)));
-		if (!pg_language_ownercheck(HeapTupleGetOid(oldtup), languageOwner))
-			aclcheck_error(ACLCHECK_NOT_OWNER, ACL_KIND_LANGUAGE,
+		if (!pg_language_ownercheck(oldform->oid, languageOwner))
+			aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_LANGUAGE,
 						   languageName);
 
 		/*
-		 * Do not change existing ownership or permissions.  Note
+		 * Do not change existing oid, ownership or permissions.  Note
 		 * dependency-update code below has to agree with this decision.
 		 */
+		replaces[Anum_pg_language_oid - 1] = false;
 		replaces[Anum_pg_language_lanowner - 1] = false;
 		replaces[Anum_pg_language_lanacl - 1] = false;
 
 		/* Okay, do it... */
 		tup = heap_modify_tuple(oldtup, tupDesc, values, nulls, replaces);
-		simple_heap_update(rel, &tup->t_self, tup);
+		CatalogTupleUpdate(rel, &tup->t_self, tup);
 
+		langoid = oldform->oid;
 		ReleaseSysCache(oldtup);
 		is_update = true;
 	}
 	else
 	{
 		/* Creating a new language */
+		langoid = GetNewOidWithIndex(rel, LanguageOidIndexId,
+									 Anum_pg_language_oid);
+		values[Anum_pg_language_oid - 1] = ObjectIdGetDatum(langoid);
 		tup = heap_form_tuple(tupDesc, values, nulls);
-		simple_heap_insert(rel, tup);
+		CatalogTupleInsert(rel, tup);
 		is_update = false;
 	}
-
-	/* Need to update indexes for either the insert or update case */
-	CatalogUpdateIndexes(rel, tup);
 
 	/*
 	 * Create dependencies for the new language.  If we are updating an
@@ -400,7 +403,7 @@ create_proc_lang(const char *languageName, bool replace,
 	 * shared dependencies do *not* need to change, and we leave them alone.)
 	 */
 	myself.classId = LanguageRelationId;
-	myself.objectId = HeapTupleGetOid(tup);
+	myself.objectId = langoid;
 	myself.objectSubId = 0;
 
 	if (is_update)
@@ -463,7 +466,7 @@ find_language_template(const char *languageName)
 	ScanKeyInit(&key,
 				Anum_pg_pltemplate_tmplname,
 				BTEqualStrategyNumber, F_NAMEEQ,
-				NameGetDatum(languageName));
+				CStringGetDatum(languageName));
 	scan = systable_beginscan(rel, PLTemplateNameIndexId, true,
 							  NULL, 1, &key);
 
@@ -515,7 +518,7 @@ find_language_template(const char *languageName)
 
 
 /*
- * This just returns TRUE if we have a valid template for a given language
+ * This just returns true if we have a valid template for a given language
  */
 bool
 PLTemplateExists(const char *languageName)
@@ -535,10 +538,10 @@ DropProceduralLanguageById(Oid langOid)
 	rel = heap_open(LanguageRelationId, RowExclusiveLock);
 
 	langTup = SearchSysCache1(LANGOID, ObjectIdGetDatum(langOid));
-	if (!HeapTupleIsValid(langTup))		/* should not happen */
+	if (!HeapTupleIsValid(langTup)) /* should not happen */
 		elog(ERROR, "cache lookup failed for language %u", langOid);
 
-	simple_heap_delete(rel, &langTup->t_self);
+	CatalogTupleDelete(rel, &langTup->t_self);
 
 	ReleaseSysCache(langTup);
 
@@ -556,7 +559,8 @@ get_language_oid(const char *langname, bool missing_ok)
 {
 	Oid			oid;
 
-	oid = GetSysCacheOid1(LANGNAME, CStringGetDatum(langname));
+	oid = GetSysCacheOid1(LANGNAME, Anum_pg_language_oid,
+						  CStringGetDatum(langname));
 	if (!OidIsValid(oid) && !missing_ok)
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_OBJECT),

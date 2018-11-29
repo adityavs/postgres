@@ -124,7 +124,7 @@ struct PGP_S2K
 	uint8		mode;
 	uint8		digest_algo;
 	uint8		salt[8];
-	uint8		iter;		/* encoded (one-octet) count */
+	uint8		iter;			/* encoded (one-octet) count */
 	/* calculated: */
 	uint8		key[PGP_MAX_KEY];
 	uint8		key_len;
@@ -155,8 +155,8 @@ struct PGP_Context
 	 */
 	int			mdc_checked;
 	int			corrupt_prefix; /* prefix failed RFC 4880 "quick check" */
-	int			unsupported_compr;		/* has bzip2 compression */
-	int			unexpected_binary;		/* binary data seen in text_mode */
+	int			unsupported_compr;	/* has bzip2 compression */
+	int			unexpected_binary;	/* binary data seen in text_mode */
 	int			in_mdc_pkt;
 	int			use_mdcbuf_filter;
 	PX_MD	   *mdc_ctx;

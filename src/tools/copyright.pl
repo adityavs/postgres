@@ -2,7 +2,7 @@
 #################################################################
 # copyright.pl -- update copyright notices throughout the source tree, idempotently.
 #
-# Copyright (c) 2011-2016, PostgreSQL Global Development Group
+# Copyright (c) 2011-2018, PostgreSQL Global Development Group
 #
 # src/tools/copyright.pl
 #
@@ -16,8 +16,8 @@ use File::Find;
 use File::Basename;
 use Tie::File;
 
-my $pgdg = 'PostgreSQL Global Development Group';
-my $cc   = 'Copyright \(c\)';
+my $pgdg      = 'PostgreSQL Global Development Group';
+my $cc        = 'Copyright \(c\)';
 my $ccliteral = 'Copyright (c)';
 
 # year-1900 is what localtime(time) puts in element 5
@@ -62,6 +62,7 @@ sub wanted
 		$line =~ s/$cc (\d{4}), $pgdg/$ccliteral $1-$year, $pgdg/i;
 	}
 	untie @lines;
+	return;
 }
 
 print "Manually update:\n";

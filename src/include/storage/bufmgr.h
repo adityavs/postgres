@@ -4,7 +4,7 @@
  *	  POSTGRES buffer manager definitions.
  *
  *
- * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/storage/bufmgr.h
@@ -14,7 +14,6 @@
 #ifndef BUFMGR_H
 #define BUFMGR_H
 
-#include "catalog/catalog.h"
 #include "storage/block.h"
 #include "storage/buf.h"
 #include "storage/bufpage.h"
@@ -48,19 +47,6 @@ typedef enum
 								 * replay; otherwise same as RBM_NORMAL */
 } ReadBufferMode;
 
-/*
- * Forced choice for whether BufferGetPage() must check snapshot age
- *
- * A scan must test for old snapshot, unless the test would be redundant (for
- * example, to tests already made at a lower level on all code paths).
- * Positioning for DML or vacuuming does not need this sort of test.
- */
-typedef enum
-{
-	BGP_NO_SNAPSHOT_TEST,		/* Not used for scan, or is redundant */
-	BGP_TEST_FOR_OLD_SNAPSHOT	/* Test for old snapshot is needed */
-} BufferGetPageAgeTest;
-
 /* forward declared, to avoid having to expose buf_internals.h here */
 struct WritebackContext;
 
@@ -68,19 +54,6 @@ struct WritebackContext;
 extern PGDLLIMPORT int NBuffers;
 
 /* in bufmgr.c */
-#define WRITEBACK_MAX_PENDING_FLUSHES 256
-
-/* FIXME: Also default to on for mmap && msync(MS_ASYNC)? */
-#ifdef HAVE_SYNC_FILE_RANGE
-#define DEFAULT_CHECKPOINT_FLUSH_AFTER 32
-#define DEFAULT_BACKEND_FLUSH_AFTER 16
-#define DEFAULT_BGWRITER_FLUSH_AFTER 64
-#else
-#define DEFAULT_CHECKPOINT_FLUSH_AFTER 0
-#define DEFAULT_BACKEND_FLUSH_AFTER 0
-#define DEFAULT_BGWRITER_FLUSH_AFTER 0
-#endif   /* HAVE_SYNC_FILE_RANGE */
-
 extern bool zero_damaged_pages;
 extern int	bgwriter_lru_maxpages;
 extern double bgwriter_lru_multiplier;
@@ -106,7 +79,7 @@ extern PGDLLIMPORT int32 *LocalRefCount;
 #define MAX_IO_CONCURRENCY 1000
 
 /* special block number for ReadBuffer() */
-#define P_NEW	InvalidBlockNumber		/* grow the file to get a new page */
+#define P_NEW	InvalidBlockNumber	/* grow the file to get a new page */
 
 /*
  * Buffer content lock modes (mode argument for LockBuffer())
@@ -178,6 +151,15 @@ extern PGDLLIMPORT int32 *LocalRefCount;
 )
 
 /*
+ * BufferGetPage
+ *		Returns the page associated with a buffer.
+ *
+ * When this is called as part of a scan, there may be a need for a nearby
+ * call to TestForOldSnapshot().  See the definition of that for details.
+ */
+#define BufferGetPage(buffer) ((Page)BufferGetBlock(buffer))
+
+/*
  * prototypes for functions in bufmgr.c
  */
 extern bool ComputeIoConcurrency(int io_concurrency, double *target);
@@ -234,6 +216,7 @@ extern void LockBuffer(Buffer buffer, int mode);
 extern bool ConditionalLockBuffer(Buffer buffer);
 extern void LockBufferForCleanup(Buffer buffer);
 extern bool ConditionalLockBufferForCleanup(Buffer buffer);
+extern bool IsBufferCleanupOK(Buffer buffer);
 extern bool HoldingBufferPinThatDelaysRecovery(void);
 
 extern void AbortBufferIO(void);
@@ -243,7 +226,7 @@ extern bool BgBufferSync(struct WritebackContext *wb_context);
 
 extern void AtProcExit_LocalBuffers(void);
 
-extern void TestForOldSnapshot(Snapshot snapshot, Relation relation, Page page);
+extern void TestForOldSnapshot_impl(Snapshot snapshot, Relation relation);
 
 /* in freelist.c */
 extern BufferAccessStrategy GetAccessStrategy(BufferAccessStrategyType btype);
@@ -253,23 +236,45 @@ extern void FreeAccessStrategy(BufferAccessStrategy strategy);
 /* inline functions */
 
 /*
- * BufferGetPage
- *		Returns the page associated with a buffer.
- *
- * For call sites where the check is not needed (which is the vast majority of
- * them), the snapshot and relation parameters can, and generally should, be
- * NULL.
+ * Although this header file is nominally backend-only, certain frontend
+ * programs like pg_waldump include it.  For compilers that emit static
+ * inline functions even when they're unused, that leads to unsatisfied
+ * external references; hence hide these with #ifndef FRONTEND.
  */
-static inline Page
-BufferGetPage(Buffer buffer, Snapshot snapshot, Relation relation,
-			  BufferGetPageAgeTest agetest)
+
+#ifndef FRONTEND
+
+/*
+ * Check whether the given snapshot is too old to have safely read the given
+ * page from the given table.  If so, throw a "snapshot too old" error.
+ *
+ * This test generally needs to be performed after every BufferGetPage() call
+ * that is executed as part of a scan.  It is not needed for calls made for
+ * modifying the page (for example, to position to the right place to insert a
+ * new index tuple or for vacuuming).  It may also be omitted where calls to
+ * lower-level functions will have already performed the test.
+ *
+ * Note that a NULL snapshot argument is allowed and causes a fast return
+ * without error; this is to support call sites which can be called from
+ * either scans or index modification areas.
+ *
+ * For best performance, keep the tests that are fastest and/or most likely to
+ * exclude a page from old snapshot testing near the front.
+ */
+static inline void
+TestForOldSnapshot(Snapshot snapshot, Relation relation, Page page)
 {
-	Page		page = (Page) BufferGetBlock(buffer);
+	Assert(relation != NULL);
 
-	if (agetest == BGP_TEST_FOR_OLD_SNAPSHOT)
-		TestForOldSnapshot(snapshot, relation, page);
-
-	return page;
+	if (old_snapshot_threshold >= 0
+		&& (snapshot) != NULL
+		&& ((snapshot)->satisfies == HeapTupleSatisfiesMVCC
+			|| (snapshot)->satisfies == HeapTupleSatisfiesToast)
+		&& !XLogRecPtrIsInvalid((snapshot)->lsn)
+		&& PageGetLSN(page) > (snapshot)->lsn)
+		TestForOldSnapshot_impl(snapshot, relation);
 }
 
-#endif
+#endif							/* FRONTEND */
+
+#endif							/* BUFMGR_H */

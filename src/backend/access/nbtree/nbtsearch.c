@@ -4,7 +4,7 @@
  *	  Search code for postgres btrees.
  *
  *
- * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -30,9 +30,13 @@ static bool _bt_readpage(IndexScanDesc scan, ScanDirection dir,
 static void _bt_saveitem(BTScanOpaque so, int itemIndex,
 			 OffsetNumber offnum, IndexTuple itup);
 static bool _bt_steppage(IndexScanDesc scan, ScanDirection dir);
+static bool _bt_readnextpage(IndexScanDesc scan, BlockNumber blkno, ScanDirection dir);
+static bool _bt_parallel_readpage(IndexScanDesc scan, BlockNumber blkno,
+					  ScanDirection dir);
 static Buffer _bt_walk_left(Relation rel, Buffer buf, Snapshot snapshot);
 static bool _bt_endpoint(IndexScanDesc scan, ScanDirection dir);
 static void _bt_drop_lock_and_maybe_pin(IndexScanDesc scan, BTScanPos sp);
+static inline void _bt_initialize_more_data(BTScanOpaque so, ScanDirection dir);
 
 
 /*
@@ -83,26 +87,25 @@ _bt_drop_lock_and_maybe_pin(IndexScanDesc scan, BTScanPos sp)
  * place during the descent through the tree.  This is not needed when
  * positioning for an insert or delete, so NULL is used for those cases.
  *
- * NOTE that the returned buffer is read-locked regardless of the access
- * parameter.  However, access = BT_WRITE will allow an empty root page
- * to be created and returned.  When access = BT_READ, an empty index
- * will result in *bufP being set to InvalidBuffer.  Also, in BT_WRITE mode,
- * any incomplete splits encountered during the search will be finished.
+ * The returned buffer is locked according to access parameter.  Additionally,
+ * access = BT_WRITE will allow an empty root page to be created and returned.
+ * When access = BT_READ, an empty index will result in *bufP being set to
+ * InvalidBuffer.  Also, in BT_WRITE mode, any incomplete splits encountered
+ * during the search will be finished.
  */
 BTStack
 _bt_search(Relation rel, int keysz, ScanKey scankey, bool nextkey,
 		   Buffer *bufP, int access, Snapshot snapshot)
 {
 	BTStack		stack_in = NULL;
+	int			page_access = BT_READ;
 
 	/* Get the root page to start with */
 	*bufP = _bt_getroot(rel, access);
 
 	/* If index is empty and access = BT_READ, no root page is created. */
 	if (!BufferIsValid(*bufP))
-	{
 		return (BTStack) NULL;
-	}
 
 	/* Loop iterates once per level descended in the tree */
 	for (;;)
@@ -130,10 +133,10 @@ _bt_search(Relation rel, int keysz, ScanKey scankey, bool nextkey,
 		 */
 		*bufP = _bt_moveright(rel, *bufP, keysz, scankey, nextkey,
 							  (access == BT_WRITE), stack_in,
-							  BT_READ, snapshot);
+							  page_access, snapshot);
 
 		/* if this is a leaf page, we're done */
-		page = BufferGetPage(*bufP, NULL, NULL, BGP_NO_SNAPSHOT_TEST);
+		page = BufferGetPage(*bufP);
 		opaque = (BTPageOpaque) PageGetSpecialPointer(page);
 		if (P_ISLEAF(opaque))
 			break;
@@ -145,14 +148,14 @@ _bt_search(Relation rel, int keysz, ScanKey scankey, bool nextkey,
 		offnum = _bt_binsrch(rel, *bufP, keysz, scankey, nextkey);
 		itemid = PageGetItemId(page, offnum);
 		itup = (IndexTuple) PageGetItem(page, itemid);
-		blkno = ItemPointerGetBlockNumber(&(itup->t_tid));
+		blkno = BTreeInnerTupleGetDownLink(itup);
 		par_blkno = BufferGetBlockNumber(*bufP);
 
 		/*
 		 * We need to save the location of the index entry we chose in the
 		 * parent page on a stack. In case we split the tree, we'll use the
 		 * stack to work back up to the parent page.  We also save the actual
-		 * downlink (TID) to uniquely identify the index entry, in case it
+		 * downlink (block) to uniquely identify the index entry, in case it
 		 * moves right while we're working lower in the tree.  See the paper
 		 * by Lehman and Yao for how this is detected and handled. (We use the
 		 * child link to disambiguate duplicate keys in the index -- Lehman
@@ -161,14 +164,43 @@ _bt_search(Relation rel, int keysz, ScanKey scankey, bool nextkey,
 		new_stack = (BTStack) palloc(sizeof(BTStackData));
 		new_stack->bts_blkno = par_blkno;
 		new_stack->bts_offset = offnum;
-		memcpy(&new_stack->bts_btentry, itup, sizeof(IndexTupleData));
+		new_stack->bts_btentry = blkno;
 		new_stack->bts_parent = stack_in;
 
+		/*
+		 * Page level 1 is lowest non-leaf page level prior to leaves.  So,
+		 * if we're on the level 1 and asked to lock leaf page in write mode,
+		 * then lock next page in write mode, because it must be a leaf.
+		 */
+		if (opaque->btpo.level == 1 && access == BT_WRITE)
+			page_access = BT_WRITE;
+
 		/* drop the read lock on the parent page, acquire one on the child */
-		*bufP = _bt_relandgetbuf(rel, *bufP, blkno, BT_READ);
+		*bufP = _bt_relandgetbuf(rel, *bufP, blkno, page_access);
 
 		/* okay, all set to move down a level */
 		stack_in = new_stack;
+	}
+
+	/*
+	 * If we're asked to lock leaf in write mode, but didn't manage to, then
+	 * relock.  That may happen when the root page appears to be leaf.
+	 */
+	if (access == BT_WRITE && page_access == BT_READ)
+	{
+		/* trade in our read lock for a write lock */
+		LockBuffer(*bufP, BUFFER_LOCK_UNLOCK);
+		LockBuffer(*bufP, BT_WRITE);
+
+		/*
+		 * If the page was split between the time that we surrendered our read
+		 * lock and acquired our write lock, then this page may no longer be
+		 * the right place for the key we want to insert.  In this case, we
+		 * need to move right in the tree.  See Lehman and Yao for an
+		 * excruciatingly precise description.
+		 */
+		*bufP = _bt_moveright(rel, *bufP, keysz, scankey, nextkey,
+							  true, stack_in, BT_WRITE, snapshot);
 	}
 
 	return stack_in;
@@ -242,7 +274,8 @@ _bt_moveright(Relation rel,
 
 	for (;;)
 	{
-		page = BufferGetPage(buf, snapshot, rel, BGP_TEST_FOR_OLD_SNAPSHOT);
+		page = BufferGetPage(buf);
+		TestForOldSnapshot(snapshot, rel, page);
 		opaque = (BTPageOpaque) PageGetSpecialPointer(page);
 
 		if (P_RIGHTMOST(opaque))
@@ -330,7 +363,7 @@ _bt_binsrch(Relation rel,
 	int32		result,
 				cmpval;
 
-	page = BufferGetPage(buf, NULL, NULL, BGP_NO_SNAPSHOT_TEST);
+	page = BufferGetPage(buf);
 	opaque = (BTPageOpaque) PageGetSpecialPointer(page);
 
 	low = P_FIRSTDATAKEY(opaque);
@@ -433,6 +466,8 @@ _bt_compare(Relation rel,
 	IndexTuple	itup;
 	int			i;
 
+	Assert(_bt_check_natts(rel, page, offnum));
+
 	/*
 	 * Force result ">" if target item is first data item on an internal page
 	 * --- see NOTE above.
@@ -463,7 +498,7 @@ _bt_compare(Relation rel,
 		datum = index_getattr(itup, scankey->sk_attno, itupdesc, &isNull);
 
 		/* see comments about NULLs handling in btbuild */
-		if (scankey->sk_flags & SK_ISNULL)		/* key is NULL */
+		if (scankey->sk_flags & SK_ISNULL)	/* key is NULL */
 		{
 			if (isNull)
 				result = 0;		/* NULL "=" NULL */
@@ -495,7 +530,7 @@ _bt_compare(Relation rel,
 													 scankey->sk_argument));
 
 			if (!(scankey->sk_flags & SK_BT_DESC))
-				result = -result;
+				INVERT_COMPARE_RESULT(result);
 		}
 
 		/* if the keys are unequal, return the difference */
@@ -521,7 +556,7 @@ _bt_compare(Relation rel,
  *		scan->xs_ctup.t_self is set to the heap TID of the current tuple,
  *		and if requested, scan->xs_itup points to a copy of the index tuple.
  *
- * If there are no matching items in the index, we return FALSE, with no
+ * If there are no matching items in the index, we return false, with no
  * pins or locks held.
  *
  * Note that scan->keyData[], and the so->keyData[] scankey built from it,
@@ -545,8 +580,10 @@ _bt_first(IndexScanDesc scan, ScanDirection dir)
 	ScanKeyData notnullkeys[INDEX_MAX_KEYS];
 	int			keysCount = 0;
 	int			i;
+	bool		status = true;
 	StrategyNumber strat_total;
 	BTScanPosItem *currItem;
+	BlockNumber blkno;
 
 	Assert(!BTScanPosIsValid(so->currPos));
 
@@ -564,6 +601,30 @@ _bt_first(IndexScanDesc scan, ScanDirection dir)
 	 */
 	if (!so->qual_ok)
 		return false;
+
+	/*
+	 * For parallel scans, get the starting page from shared state. If the
+	 * scan has not started, proceed to find out first leaf page in the usual
+	 * way while keeping other participating processes waiting.  If the scan
+	 * has already begun, use the page number from the shared structure.
+	 */
+	if (scan->parallel_scan != NULL)
+	{
+		status = _bt_parallel_seize(scan, &blkno);
+		if (!status)
+			return false;
+		else if (blkno == P_NONE)
+		{
+			_bt_parallel_done(scan);
+			return false;
+		}
+		else if (blkno != InvalidBlockNumber)
+		{
+			if (!_bt_parallel_readpage(scan, blkno, dir))
+				return false;
+			goto readcomplete;
+		}
+	}
 
 	/*----------
 	 * Examine the scan keys to discover where we need to start the scan.
@@ -652,11 +713,11 @@ _bt_first(IndexScanDesc scan, ScanDirection dir)
 					ScanKeyEntryInitialize(chosen,
 										   (SK_SEARCHNOTNULL | SK_ISNULL |
 											(impliesNN->sk_flags &
-										  (SK_BT_DESC | SK_BT_NULLS_FIRST))),
+											 (SK_BT_DESC | SK_BT_NULLS_FIRST))),
 										   curattr,
-								 ((impliesNN->sk_flags & SK_BT_NULLS_FIRST) ?
-								  BTGreaterStrategyNumber :
-								  BTLessStrategyNumber),
+										   ((impliesNN->sk_flags & SK_BT_NULLS_FIRST) ?
+											BTGreaterStrategyNumber :
+											BTLessStrategyNumber),
 										   InvalidOid,
 										   InvalidOid,
 										   InvalidOid,
@@ -744,7 +805,19 @@ _bt_first(IndexScanDesc scan, ScanDirection dir)
 	 * there.
 	 */
 	if (keysCount == 0)
-		return _bt_endpoint(scan, dir);
+	{
+		bool		match;
+
+		match = _bt_endpoint(scan, dir);
+
+		if (!match)
+		{
+			/* No match, so mark (parallel) scan finished */
+			_bt_parallel_done(scan);
+		}
+
+		return match;
+	}
 
 	/*
 	 * We want to start the scan somewhere within the index.  Set up an
@@ -774,7 +847,10 @@ _bt_first(IndexScanDesc scan, ScanDirection dir)
 
 			Assert(subkey->sk_flags & SK_ROW_MEMBER);
 			if (subkey->sk_flags & SK_ISNULL)
+			{
+				_bt_parallel_done(scan);
 				return false;
+			}
 			memcpy(scankeys + i, subkey, sizeof(ScanKeyData));
 
 			/*
@@ -994,25 +1070,21 @@ _bt_first(IndexScanDesc scan, ScanDirection dir)
 		 * because nothing finer to lock exists.
 		 */
 		PredicateLockRelation(rel, scan->xs_snapshot);
+
+		/*
+		 * mark parallel scan as done, so that all the workers can finish
+		 * their scan
+		 */
+		_bt_parallel_done(scan);
+		BTScanPosInvalidate(so->currPos);
+
 		return false;
 	}
 	else
 		PredicateLockPage(rel, BufferGetBlockNumber(buf),
 						  scan->xs_snapshot);
 
-	/* initialize moreLeft/moreRight appropriately for scan direction */
-	if (ScanDirectionIsForward(dir))
-	{
-		so->currPos.moreLeft = false;
-		so->currPos.moreRight = true;
-	}
-	else
-	{
-		so->currPos.moreLeft = true;
-		so->currPos.moreRight = false;
-	}
-	so->numKilled = 0;			/* just paranoia */
-	so->markItemIndex = -1;		/* ditto */
+	_bt_initialize_more_data(so, dir);
 
 	/* position to the precise item on the page */
 	offnum = _bt_binsrch(rel, buf, keysCount, scankeys, nextkey);
@@ -1061,6 +1133,7 @@ _bt_first(IndexScanDesc scan, ScanDirection dir)
 		_bt_drop_lock_and_maybe_pin(scan, &so->currPos);
 	}
 
+readcomplete:
 	/* OK, itemIndex says what to return */
 	currItem = &so->currPos.items[so->currPos.itemIndex];
 	scan->xs_ctup.t_self = currItem->heapTid;
@@ -1133,6 +1206,10 @@ _bt_next(IndexScanDesc scan, ScanDirection dir)
  * moreLeft or moreRight (as appropriate) is cleared if _bt_checkkeys reports
  * that there can be no more matching tuples in the current scan direction.
  *
+ * In the case of a parallel scan, caller must have called _bt_parallel_seize
+ * prior to calling this function; this function will invoke
+ * _bt_parallel_release before returning.
+ *
  * Returns true if any matching items found on the page, false if none.
  */
 static bool
@@ -1153,8 +1230,18 @@ _bt_readpage(IndexScanDesc scan, ScanDirection dir, OffsetNumber offnum)
 	 */
 	Assert(BufferIsValid(so->currPos.buf));
 
-	page = BufferGetPage(so->currPos.buf, NULL, NULL, BGP_NO_SNAPSHOT_TEST);
+	page = BufferGetPage(so->currPos.buf);
 	opaque = (BTPageOpaque) PageGetSpecialPointer(page);
+
+	/* allow next page be processed by parallel worker */
+	if (scan->parallel_scan)
+	{
+		if (ScanDirectionIsForward(dir))
+			_bt_parallel_release(scan, opaque->btpo_next);
+		else
+			_bt_parallel_release(scan, BufferGetBlockNumber(so->currPos.buf));
+	}
+
 	minoff = P_FIRSTDATAKEY(opaque);
 	maxoff = PageGetMaxOffsetNumber(page);
 
@@ -1169,7 +1256,7 @@ _bt_readpage(IndexScanDesc scan, ScanDirection dir, OffsetNumber offnum)
 	 * safe to apply LP_DEAD hints to the page later.  This allows us to drop
 	 * the pin for MVCC scans, which allows vacuum to avoid blocking.
 	 */
-	so->currPos.lsn = PageGetLSN(page);
+	so->currPos.lsn = BufferGetLSNAtomic(so->currPos.buf);
 
 	/*
 	 * we must save the page's right-link while scanning it; this tells us
@@ -1279,21 +1366,16 @@ _bt_saveitem(BTScanOpaque so, int itemIndex,
  * if pinned, we'll drop the pin before moving to next page.  The buffer is
  * not locked on entry.
  *
- * On success exit, so->currPos is updated to contain data from the next
- * interesting page.  For success on a scan using a non-MVCC snapshot we hold
- * a pin, but not a read lock, on that page.  If we do not hold the pin, we
- * set so->currPos.buf to InvalidBuffer.  We return TRUE to indicate success.
- *
- * If there are no more matching records in the given direction, we drop all
- * locks and pins, set so->currPos.buf to InvalidBuffer, and return FALSE.
+ * For success on a scan using a non-MVCC snapshot we hold a pin, but not a
+ * read lock, on that page.  If we do not hold the pin, we set so->currPos.buf
+ * to InvalidBuffer.  We return true to indicate success.
  */
 static bool
 _bt_steppage(IndexScanDesc scan, ScanDirection dir)
 {
 	BTScanOpaque so = (BTScanOpaque) scan->opaque;
-	Relation	rel;
-	Page		page;
-	BTPageOpaque opaque;
+	BlockNumber blkno = InvalidBlockNumber;
+	bool		status = true;
 
 	Assert(BTScanPosIsValid(so->currPos));
 
@@ -1320,25 +1402,103 @@ _bt_steppage(IndexScanDesc scan, ScanDirection dir)
 		so->markItemIndex = -1;
 	}
 
-	rel = scan->indexRelation;
-
 	if (ScanDirectionIsForward(dir))
 	{
 		/* Walk right to the next page with data */
-		/* We must rely on the previously saved nextPage link! */
-		BlockNumber blkno = so->currPos.nextPage;
+		if (scan->parallel_scan != NULL)
+		{
+			/*
+			 * Seize the scan to get the next block number; if the scan has
+			 * ended already, bail out.
+			 */
+			status = _bt_parallel_seize(scan, &blkno);
+			if (!status)
+			{
+				/* release the previous buffer, if pinned */
+				BTScanPosUnpinIfPinned(so->currPos);
+				BTScanPosInvalidate(so->currPos);
+				return false;
+			}
+		}
+		else
+		{
+			/* Not parallel, so use the previously-saved nextPage link. */
+			blkno = so->currPos.nextPage;
+		}
 
 		/* Remember we left a page with data */
 		so->currPos.moreLeft = true;
 
 		/* release the previous buffer, if pinned */
 		BTScanPosUnpinIfPinned(so->currPos);
+	}
+	else
+	{
+		/* Remember we left a page with data */
+		so->currPos.moreRight = true;
 
+		if (scan->parallel_scan != NULL)
+		{
+			/*
+			 * Seize the scan to get the current block number; if the scan has
+			 * ended already, bail out.
+			 */
+			status = _bt_parallel_seize(scan, &blkno);
+			BTScanPosUnpinIfPinned(so->currPos);
+			if (!status)
+			{
+				BTScanPosInvalidate(so->currPos);
+				return false;
+			}
+		}
+		else
+		{
+			/* Not parallel, so just use our own notion of the current page */
+			blkno = so->currPos.currPage;
+		}
+	}
+
+	if (!_bt_readnextpage(scan, blkno, dir))
+		return false;
+
+	/* Drop the lock, and maybe the pin, on the current page */
+	_bt_drop_lock_and_maybe_pin(scan, &so->currPos);
+
+	return true;
+}
+
+/*
+ *	_bt_readnextpage() -- Read next page containing valid data for scan
+ *
+ * On success exit, so->currPos is updated to contain data from the next
+ * interesting page.  Caller is responsible to release lock and pin on
+ * buffer on success.  We return true to indicate success.
+ *
+ * If there are no more matching records in the given direction, we drop all
+ * locks and pins, set so->currPos.buf to InvalidBuffer, and return false.
+ */
+static bool
+_bt_readnextpage(IndexScanDesc scan, BlockNumber blkno, ScanDirection dir)
+{
+	BTScanOpaque so = (BTScanOpaque) scan->opaque;
+	Relation	rel;
+	Page		page;
+	BTPageOpaque opaque;
+	bool		status = true;
+
+	rel = scan->indexRelation;
+
+	if (ScanDirectionIsForward(dir))
+	{
 		for (;;)
 		{
-			/* if we're at end of scan, give up */
+			/*
+			 * if we're at end of scan, give up and mark parallel scan as
+			 * done, so that all the workers can finish their scan
+			 */
 			if (blkno == P_NONE || !so->currPos.moreRight)
 			{
+				_bt_parallel_done(scan);
 				BTScanPosInvalidate(so->currPos);
 				return false;
 			}
@@ -1346,10 +1506,10 @@ _bt_steppage(IndexScanDesc scan, ScanDirection dir)
 			CHECK_FOR_INTERRUPTS();
 			/* step right one page */
 			so->currPos.buf = _bt_getbuf(rel, blkno, BT_READ);
-			/* check for deleted page */
-			page = BufferGetPage(so->currPos.buf, scan->xs_snapshot, rel,
-								 BGP_TEST_FOR_OLD_SNAPSHOT);
+			page = BufferGetPage(so->currPos.buf);
+			TestForOldSnapshot(scan->xs_snapshot, rel, page);
 			opaque = (BTPageOpaque) PageGetSpecialPointer(page);
+			/* check for deleted page */
 			if (!P_IGNORE(opaque))
 			{
 				PredicateLockPage(rel, blkno, scan->xs_snapshot);
@@ -1358,16 +1518,41 @@ _bt_steppage(IndexScanDesc scan, ScanDirection dir)
 				if (_bt_readpage(scan, dir, P_FIRSTDATAKEY(opaque)))
 					break;
 			}
+			else if (scan->parallel_scan != NULL)
+			{
+				/* allow next page be processed by parallel worker */
+				_bt_parallel_release(scan, opaque->btpo_next);
+			}
 
 			/* nope, keep going */
-			blkno = opaque->btpo_next;
-			_bt_relbuf(rel, so->currPos.buf);
+			if (scan->parallel_scan != NULL)
+			{
+				_bt_relbuf(rel, so->currPos.buf);
+				status = _bt_parallel_seize(scan, &blkno);
+				if (!status)
+				{
+					BTScanPosInvalidate(so->currPos);
+					return false;
+				}
+			}
+			else
+			{
+				blkno = opaque->btpo_next;
+				_bt_relbuf(rel, so->currPos.buf);
+			}
 		}
 	}
 	else
 	{
-		/* Remember we left a page with data */
-		so->currPos.moreRight = true;
+		/*
+		 * Should only happen in parallel cases, when some other backend
+		 * advanced the scan.
+		 */
+		if (so->currPos.currPage != blkno)
+		{
+			BTScanPosUnpinIfPinned(so->currPos);
+			so->currPos.currPage = blkno;
+		}
 
 		/*
 		 * Walk left to the next page with data.  This is much more complex
@@ -1402,6 +1587,7 @@ _bt_steppage(IndexScanDesc scan, ScanDirection dir)
 			if (!so->currPos.moreLeft)
 			{
 				_bt_relbuf(rel, so->currPos.buf);
+				_bt_parallel_done(scan);
 				BTScanPosInvalidate(so->currPos);
 				return false;
 			}
@@ -1413,6 +1599,7 @@ _bt_steppage(IndexScanDesc scan, ScanDirection dir)
 			/* if we're physically at end of index, return failure */
 			if (so->currPos.buf == InvalidBuffer)
 			{
+				_bt_parallel_done(scan);
 				BTScanPosInvalidate(so->currPos);
 				return false;
 			}
@@ -1422,8 +1609,8 @@ _bt_steppage(IndexScanDesc scan, ScanDirection dir)
 			 * it's not half-dead and contains matching tuples. Else loop back
 			 * and do it all again.
 			 */
-			page = BufferGetPage(so->currPos.buf, scan->xs_snapshot, rel,
-								 BGP_TEST_FOR_OLD_SNAPSHOT);
+			page = BufferGetPage(so->currPos.buf);
+			TestForOldSnapshot(scan->xs_snapshot, rel, page);
 			opaque = (BTPageOpaque) PageGetSpecialPointer(page);
 			if (!P_IGNORE(opaque))
 			{
@@ -1433,8 +1620,50 @@ _bt_steppage(IndexScanDesc scan, ScanDirection dir)
 				if (_bt_readpage(scan, dir, PageGetMaxOffsetNumber(page)))
 					break;
 			}
+			else if (scan->parallel_scan != NULL)
+			{
+				/* allow next page be processed by parallel worker */
+				_bt_parallel_release(scan, BufferGetBlockNumber(so->currPos.buf));
+			}
+
+			/*
+			 * For parallel scans, get the last page scanned as it is quite
+			 * possible that by the time we try to seize the scan, some other
+			 * worker has already advanced the scan to a different page.  We
+			 * must continue based on the latest page scanned by any worker.
+			 */
+			if (scan->parallel_scan != NULL)
+			{
+				_bt_relbuf(rel, so->currPos.buf);
+				status = _bt_parallel_seize(scan, &blkno);
+				if (!status)
+				{
+					BTScanPosInvalidate(so->currPos);
+					return false;
+				}
+				so->currPos.buf = _bt_getbuf(rel, blkno, BT_READ);
+			}
 		}
 	}
+
+	return true;
+}
+
+/*
+ *	_bt_parallel_readpage() -- Read current page containing valid data for scan
+ *
+ * On success, release lock and maybe pin on buffer.  We return true to
+ * indicate success.
+ */
+static bool
+_bt_parallel_readpage(IndexScanDesc scan, BlockNumber blkno, ScanDirection dir)
+{
+	BTScanOpaque so = (BTScanOpaque) scan->opaque;
+
+	_bt_initialize_more_data(so, dir);
+
+	if (!_bt_readnextpage(scan, blkno, dir))
+		return false;
 
 	/* Drop the lock, and maybe the pin, on the current page */
 	_bt_drop_lock_and_maybe_pin(scan, &so->currPos);
@@ -1462,7 +1691,7 @@ _bt_walk_left(Relation rel, Buffer buf, Snapshot snapshot)
 	Page		page;
 	BTPageOpaque opaque;
 
-	page = BufferGetPage(buf, NULL, NULL, BGP_NO_SNAPSHOT_TEST);
+	page = BufferGetPage(buf);
 	opaque = (BTPageOpaque) PageGetSpecialPointer(page);
 
 	for (;;)
@@ -1486,7 +1715,8 @@ _bt_walk_left(Relation rel, Buffer buf, Snapshot snapshot)
 		/* check for interrupts while we're not holding any buffer lock */
 		CHECK_FOR_INTERRUPTS();
 		buf = _bt_getbuf(rel, blkno, BT_READ);
-		page = BufferGetPage(buf, snapshot, rel, BGP_TEST_FOR_OLD_SNAPSHOT);
+		page = BufferGetPage(buf);
+		TestForOldSnapshot(snapshot, rel, page);
 		opaque = (BTPageOpaque) PageGetSpecialPointer(page);
 
 		/*
@@ -1512,14 +1742,15 @@ _bt_walk_left(Relation rel, Buffer buf, Snapshot snapshot)
 				break;
 			blkno = opaque->btpo_next;
 			buf = _bt_relandgetbuf(rel, buf, blkno, BT_READ);
-			page = BufferGetPage(buf, snapshot, rel,
-								 BGP_TEST_FOR_OLD_SNAPSHOT);
+			page = BufferGetPage(buf);
+			TestForOldSnapshot(snapshot, rel, page);
 			opaque = (BTPageOpaque) PageGetSpecialPointer(page);
 		}
 
 		/* Return to the original page to see what's up */
 		buf = _bt_relandgetbuf(rel, buf, obknum, BT_READ);
-		page = BufferGetPage(buf, snapshot, rel, BGP_TEST_FOR_OLD_SNAPSHOT);
+		page = BufferGetPage(buf);
+		TestForOldSnapshot(snapshot, rel, page);
 		opaque = (BTPageOpaque) PageGetSpecialPointer(page);
 		if (P_ISDELETED(opaque))
 		{
@@ -1536,8 +1767,8 @@ _bt_walk_left(Relation rel, Buffer buf, Snapshot snapshot)
 						 RelationGetRelationName(rel));
 				blkno = opaque->btpo_next;
 				buf = _bt_relandgetbuf(rel, buf, blkno, BT_READ);
-				page = BufferGetPage(buf, snapshot, rel,
-									 BGP_TEST_FOR_OLD_SNAPSHOT);
+				page = BufferGetPage(buf);
+				TestForOldSnapshot(snapshot, rel, page);
 				opaque = (BTPageOpaque) PageGetSpecialPointer(page);
 				if (!P_ISDELETED(opaque))
 					break;
@@ -1597,7 +1828,8 @@ _bt_get_endpoint(Relation rel, uint32 level, bool rightmost,
 	if (!BufferIsValid(buf))
 		return InvalidBuffer;
 
-	page = BufferGetPage(buf, snapshot, rel, BGP_TEST_FOR_OLD_SNAPSHOT);
+	page = BufferGetPage(buf);
+	TestForOldSnapshot(snapshot, rel, page);
 	opaque = (BTPageOpaque) PageGetSpecialPointer(page);
 
 	for (;;)
@@ -1616,8 +1848,8 @@ _bt_get_endpoint(Relation rel, uint32 level, bool rightmost,
 				elog(ERROR, "fell off the end of index \"%s\"",
 					 RelationGetRelationName(rel));
 			buf = _bt_relandgetbuf(rel, buf, blkno, BT_READ);
-			page = BufferGetPage(buf, snapshot, rel,
-								 BGP_TEST_FOR_OLD_SNAPSHOT);
+			page = BufferGetPage(buf);
+			TestForOldSnapshot(snapshot, rel, page);
 			opaque = (BTPageOpaque) PageGetSpecialPointer(page);
 		}
 
@@ -1635,10 +1867,10 @@ _bt_get_endpoint(Relation rel, uint32 level, bool rightmost,
 			offnum = P_FIRSTDATAKEY(opaque);
 
 		itup = (IndexTuple) PageGetItem(page, PageGetItemId(page, offnum));
-		blkno = ItemPointerGetBlockNumber(&(itup->t_tid));
+		blkno = BTreeInnerTupleGetDownLink(itup);
 
 		buf = _bt_relandgetbuf(rel, buf, blkno, BT_READ);
-		page = BufferGetPage(buf, NULL, NULL, BGP_NO_SNAPSHOT_TEST);
+		page = BufferGetPage(buf);
 		opaque = (BTPageOpaque) PageGetSpecialPointer(page);
 	}
 
@@ -1684,7 +1916,7 @@ _bt_endpoint(IndexScanDesc scan, ScanDirection dir)
 	}
 
 	PredicateLockPage(rel, BufferGetBlockNumber(buf), scan->xs_snapshot);
-	page = BufferGetPage(buf, NULL, NULL, BGP_NO_SNAPSHOT_TEST);
+	page = BufferGetPage(buf);
 	opaque = (BTPageOpaque) PageGetSpecialPointer(page);
 	Assert(P_ISLEAF(opaque));
 
@@ -1710,19 +1942,7 @@ _bt_endpoint(IndexScanDesc scan, ScanDirection dir)
 	/* remember which buffer we have pinned */
 	so->currPos.buf = buf;
 
-	/* initialize moreLeft/moreRight appropriately for scan direction */
-	if (ScanDirectionIsForward(dir))
-	{
-		so->currPos.moreLeft = false;
-		so->currPos.moreRight = true;
-	}
-	else
-	{
-		so->currPos.moreLeft = true;
-		so->currPos.moreRight = false;
-	}
-	so->numKilled = 0;			/* just paranoia */
-	so->markItemIndex = -1;		/* ditto */
+	_bt_initialize_more_data(so, dir);
 
 	/*
 	 * Now load data from the first page of the scan.
@@ -1750,4 +1970,26 @@ _bt_endpoint(IndexScanDesc scan, ScanDirection dir)
 		scan->xs_itup = (IndexTuple) (so->currTuples + currItem->tupleOffset);
 
 	return true;
+}
+
+/*
+ * _bt_initialize_more_data() -- initialize moreLeft/moreRight appropriately
+ * for scan direction
+ */
+static inline void
+_bt_initialize_more_data(BTScanOpaque so, ScanDirection dir)
+{
+	/* initialize moreLeft/moreRight appropriately for scan direction */
+	if (ScanDirectionIsForward(dir))
+	{
+		so->currPos.moreLeft = false;
+		so->currPos.moreRight = true;
+	}
+	else
+	{
+		so->currPos.moreLeft = true;
+		so->currPos.moreRight = false;
+	}
+	so->numKilled = 0;			/* just paranoia */
+	so->markItemIndex = -1;		/* ditto */
 }

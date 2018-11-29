@@ -3,7 +3,7 @@
  * amcmds.c
  *	  Routines for SQL commands that manipulate access methods.
  *
- * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -15,6 +15,7 @@
 
 #include "access/heapam.h"
 #include "access/htup_details.h"
+#include "catalog/catalog.h"
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
 #include "catalog/pg_am.h"
@@ -34,7 +35,7 @@ static const char *get_am_type_string(char amtype);
 
 
 /*
- * CreateAcessMethod
+ * CreateAccessMethod
  *		Registers a new access method.
  */
 ObjectAddress
@@ -60,7 +61,8 @@ CreateAccessMethod(CreateAmStmt *stmt)
 				 errhint("Must be superuser to create an access method.")));
 
 	/* Check if name is used */
-	amoid = GetSysCacheOid1(AMNAME, CStringGetDatum(stmt->amname));
+	amoid = GetSysCacheOid1(AMNAME,  Anum_pg_am_oid,
+							CStringGetDatum(stmt->amname));
 	if (OidIsValid(amoid))
 	{
 		ereport(ERROR,
@@ -80,6 +82,8 @@ CreateAccessMethod(CreateAmStmt *stmt)
 	memset(values, 0, sizeof(values));
 	memset(nulls, false, sizeof(nulls));
 
+	amoid = GetNewOidWithIndex(rel, AmOidIndexId, Anum_pg_am_oid);
+	values[Anum_pg_am_oid - 1] = ObjectIdGetDatum(amoid);
 	values[Anum_pg_am_amname - 1] =
 		DirectFunctionCall1(namein, CStringGetDatum(stmt->amname));
 	values[Anum_pg_am_amhandler - 1] = ObjectIdGetDatum(amhandler);
@@ -87,8 +91,7 @@ CreateAccessMethod(CreateAmStmt *stmt)
 
 	tup = heap_form_tuple(RelationGetDescr(rel), values, nulls);
 
-	amoid = simple_heap_insert(rel, tup);
-	CatalogUpdateIndexes(rel, tup);
+	CatalogTupleInsert(rel, tup);
 	heap_freetuple(tup);
 
 	myself.classId = AccessMethodRelationId;
@@ -129,7 +132,7 @@ RemoveAccessMethodById(Oid amOid)
 	if (!HeapTupleIsValid(tup))
 		elog(ERROR, "cache lookup failed for access method %u", amOid);
 
-	simple_heap_delete(relation, &tup->t_self);
+	CatalogTupleDelete(relation, &tup->t_self);
 
 	ReleaseSysCache(tup);
 
@@ -138,7 +141,7 @@ RemoveAccessMethodById(Oid amOid)
 
 /*
  * get_am_type_oid
- * 		Worker for various get_am_*_oid variants
+ *		Worker for various get_am_*_oid variants
  *
  * If missing_ok is false, throw an error if access method not found.  If
  * true, just return InvalidOid.
@@ -165,7 +168,7 @@ get_am_type_oid(const char *amname, char amtype, bool missing_ok)
 							NameStr(amform->amname),
 							get_am_type_string(amtype))));
 
-		oid = HeapTupleGetOid(tup);
+		oid = amform->oid;
 		ReleaseSysCache(tup);
 	}
 
@@ -188,7 +191,7 @@ get_index_am_oid(const char *amname, bool missing_ok)
 
 /*
  * get_am_oid - given an access method name, look up its OID.
- * 		The type is not checked.
+ *		The type is not checked.
  */
 Oid
 get_am_oid(const char *amname, bool missing_ok)

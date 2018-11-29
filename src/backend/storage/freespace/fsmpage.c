@@ -4,7 +4,7 @@
  *	  routines to search and manipulate one FSM page.
  *
  *
- * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -158,7 +158,7 @@ int
 fsm_search_avail(Buffer buf, uint8 minvalue, bool advancenext,
 				 bool exclusive_lock_held)
 {
-	Page		page = BufferGetPage(buf, NULL, NULL, BGP_NO_SNAPSHOT_TEST);
+	Page		page = BufferGetPage(buf);
 	FSMPage		fsmpage = (FSMPage) PageGetContents(page);
 	int			nodeno;
 	int			target;

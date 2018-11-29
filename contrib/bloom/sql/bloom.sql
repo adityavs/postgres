@@ -50,6 +50,28 @@ SELECT count(*) FROM tst WHERE i = 7;
 SELECT count(*) FROM tst WHERE t = '5';
 SELECT count(*) FROM tst WHERE i = 7 AND t = '5';
 
+-- Try an unlogged table too
+
+CREATE UNLOGGED TABLE tstu (
+	i	int4,
+	t	text
+);
+
+INSERT INTO tstu SELECT i%10, substr(md5(i::text), 1, 1) FROM generate_series(1,2000) i;
+CREATE INDEX bloomidxu ON tstu USING bloom (i, t) WITH (col2 = 4);
+
+SET enable_seqscan=off;
+SET enable_bitmapscan=on;
+SET enable_indexscan=on;
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM tstu WHERE i = 7;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM tstu WHERE t = '5';
+EXPLAIN (COSTS OFF) SELECT count(*) FROM tstu WHERE i = 7 AND t = '5';
+
+SELECT count(*) FROM tstu WHERE i = 7;
+SELECT count(*) FROM tstu WHERE t = '5';
+SELECT count(*) FROM tstu WHERE i = 7 AND t = '5';
+
 RESET enable_seqscan;
 RESET enable_bitmapscan;
 RESET enable_indexscan;
@@ -59,3 +81,14 @@ SELECT opcname, amvalidate(opc.oid)
 FROM pg_opclass opc JOIN pg_am am ON am.oid = opcmethod
 WHERE amname = 'bloom'
 ORDER BY 1;
+
+--
+-- relation options
+--
+DROP INDEX bloomidx;
+CREATE INDEX bloomidx ON tst USING bloom (i, t) WITH (length=7, col1=4);
+SELECT reloptions FROM pg_class WHERE oid = 'bloomidx'::regclass;
+-- check for min and max values
+\set VERBOSITY terse
+CREATE INDEX bloomidx2 ON tst USING bloom (i, t) WITH (length=0);
+CREATE INDEX bloomidx2 ON tst USING bloom (i, t) WITH (col1=0);

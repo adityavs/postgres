@@ -22,33 +22,53 @@
 -- allowed.
 
 -- This should match IsBinaryCoercible() in parse_coerce.c.
+-- It doesn't currently know about some cases, notably domains, anyelement,
+-- anynonarray, anyenum, or record, but it doesn't need to (yet).
 create function binary_coercible(oid, oid) returns bool as $$
-SELECT ($1 = $2) OR
- EXISTS(select 1 from pg_catalog.pg_cast where
-        castsource = $1 and casttarget = $2 and
-        castmethod = 'b' and castcontext = 'i') OR
- ($2 = 'pg_catalog.any'::pg_catalog.regtype) OR
- ($2 = 'pg_catalog.anyarray'::pg_catalog.regtype AND
-  EXISTS(select 1 from pg_catalog.pg_type where
-         oid = $1 and typelem != 0 and typlen = -1)) OR
- ($2 = 'pg_catalog.anyrange'::pg_catalog.regtype AND
-  (select typtype from pg_catalog.pg_type where oid = $1) = 'r')
-$$ language sql strict stable;
+begin
+  if $1 = $2 then return true; end if;
+  if EXISTS(select 1 from pg_catalog.pg_cast where
+            castsource = $1 and casttarget = $2 and
+            castmethod = 'b' and castcontext = 'i')
+  then return true; end if;
+  if $2 = 'pg_catalog.any'::pg_catalog.regtype then return true; end if;
+  if $2 = 'pg_catalog.anyarray'::pg_catalog.regtype then
+    if EXISTS(select 1 from pg_catalog.pg_type where
+              oid = $1 and typelem != 0 and typlen = -1)
+    then return true; end if;
+  end if;
+  if $2 = 'pg_catalog.anyrange'::pg_catalog.regtype then
+    if (select typtype from pg_catalog.pg_type where oid = $1) = 'r'
+    then return true; end if;
+  end if;
+  return false;
+end
+$$ language plpgsql strict stable;
 
--- This one ignores castcontext, so it considers only physical equivalence
--- and not whether the coercion can be invoked implicitly.
-create function physically_coercible(oid, oid) returns bool as $$
-SELECT ($1 = $2) OR
- EXISTS(select 1 from pg_catalog.pg_cast where
-        castsource = $1 and casttarget = $2 and
-        castmethod = 'b') OR
- ($2 = 'pg_catalog.any'::pg_catalog.regtype) OR
- ($2 = 'pg_catalog.anyarray'::pg_catalog.regtype AND
-  EXISTS(select 1 from pg_catalog.pg_type where
-         oid = $1 and typelem != 0 and typlen = -1)) OR
- ($2 = 'pg_catalog.anyrange'::pg_catalog.regtype AND
-  (select typtype from pg_catalog.pg_type where oid = $1) = 'r')
-$$ language sql strict stable;
+-- This one ignores castcontext, so it will allow cases where an explicit
+-- (but still binary) cast would be required to convert the input type.
+-- We don't currently use this for any tests in this file, but it is a
+-- reasonable alternative definition for some scenarios.
+create function explicitly_binary_coercible(oid, oid) returns bool as $$
+begin
+  if $1 = $2 then return true; end if;
+  if EXISTS(select 1 from pg_catalog.pg_cast where
+            castsource = $1 and casttarget = $2 and
+            castmethod = 'b')
+  then return true; end if;
+  if $2 = 'pg_catalog.any'::pg_catalog.regtype then return true; end if;
+  if $2 = 'pg_catalog.anyarray'::pg_catalog.regtype then
+    if EXISTS(select 1 from pg_catalog.pg_type where
+              oid = $1 and typelem != 0 and typlen = -1)
+    then return true; end if;
+  end if;
+  if $2 = 'pg_catalog.anyrange'::pg_catalog.regtype then
+    if (select typtype from pg_catalog.pg_type where oid = $1) = 'r'
+    then return true; end if;
+  end if;
+  return false;
+end
+$$ language plpgsql strict stable;
 
 
 -- **************** pg_proc ****************
@@ -66,6 +86,7 @@ WHERE p1.prolang = 0 OR p1.prorettype = 0 OR
        0::oid = ANY (p1.proargtypes) OR
        procost <= 0 OR
        CASE WHEN proretset THEN prorows <= 0 ELSE prorows != 0 END OR
+       prokind NOT IN ('f', 'a', 'w', 'p') OR
        provolatile NOT IN ('i', 's', 'v') OR
        proparallel NOT IN ('s', 'r', 'u');
 
@@ -74,10 +95,17 @@ SELECT p1.oid, p1.proname
 FROM pg_proc as p1
 WHERE prosrc IS NULL OR prosrc = '' OR prosrc = '-';
 
--- proiswindow shouldn't be set together with proisagg or proretset
+-- proretset should only be set for normal functions
 SELECT p1.oid, p1.proname
 FROM pg_proc AS p1
-WHERE proiswindow AND (proisagg OR proretset);
+WHERE proretset AND prokind != 'f';
+
+-- currently, no built-in functions should be SECURITY DEFINER;
+-- this might change in future, but there will probably never be many.
+SELECT p1.oid, p1.proname
+FROM pg_proc AS p1
+WHERE prosecdef
+ORDER BY 1;
 
 -- pronargdefaults should be 0 iff proargdefaults is null
 SELECT p1.oid, p1.proname
@@ -117,9 +145,9 @@ FROM pg_proc AS p1, pg_proc AS p2
 WHERE p1.oid < p2.oid AND
     p1.prosrc = p2.prosrc AND
     p1.prolang = 12 AND p2.prolang = 12 AND
-    (p1.proisagg = false OR p2.proisagg = false) AND
+    (p1.prokind != 'a' OR p2.prokind != 'a') AND
     (p1.prolang != p2.prolang OR
-     p1.proisagg != p2.proisagg OR
+     p1.prokind != p2.prokind OR
      p1.prosecdef != p2.prosecdef OR
      p1.proleakproof != p2.proleakproof OR
      p1.proisstrict != p2.proisstrict OR
@@ -143,7 +171,7 @@ FROM pg_proc AS p1, pg_proc AS p2
 WHERE p1.oid != p2.oid AND
     p1.prosrc = p2.prosrc AND
     p1.prolang = 12 AND p2.prolang = 12 AND
-    NOT p1.proisagg AND NOT p2.proisagg AND
+    p1.prokind != 'a' AND p2.prokind != 'a' AND
     p1.prosrc NOT LIKE E'range\\_constructor_' AND
     p2.prosrc NOT LIKE E'range\\_constructor_' AND
     (p1.prorettype < p2.prorettype)
@@ -154,7 +182,7 @@ FROM pg_proc AS p1, pg_proc AS p2
 WHERE p1.oid != p2.oid AND
     p1.prosrc = p2.prosrc AND
     p1.prolang = 12 AND p2.prolang = 12 AND
-    NOT p1.proisagg AND NOT p2.proisagg AND
+    p1.prokind != 'a' AND p2.prokind != 'a' AND
     p1.prosrc NOT LIKE E'range\\_constructor_' AND
     p2.prosrc NOT LIKE E'range\\_constructor_' AND
     (p1.proargtypes[0] < p2.proargtypes[0])
@@ -165,7 +193,7 @@ FROM pg_proc AS p1, pg_proc AS p2
 WHERE p1.oid != p2.oid AND
     p1.prosrc = p2.prosrc AND
     p1.prolang = 12 AND p2.prolang = 12 AND
-    NOT p1.proisagg AND NOT p2.proisagg AND
+    p1.prokind != 'a' AND p2.prokind != 'a' AND
     p1.prosrc NOT LIKE E'range\\_constructor_' AND
     p2.prosrc NOT LIKE E'range\\_constructor_' AND
     (p1.proargtypes[1] < p2.proargtypes[1])
@@ -176,7 +204,7 @@ FROM pg_proc AS p1, pg_proc AS p2
 WHERE p1.oid != p2.oid AND
     p1.prosrc = p2.prosrc AND
     p1.prolang = 12 AND p2.prolang = 12 AND
-    NOT p1.proisagg AND NOT p2.proisagg AND
+    p1.prokind != 'a' AND p2.prokind != 'a' AND
     (p1.proargtypes[2] < p2.proargtypes[2])
 ORDER BY 1, 2;
 
@@ -185,7 +213,7 @@ FROM pg_proc AS p1, pg_proc AS p2
 WHERE p1.oid != p2.oid AND
     p1.prosrc = p2.prosrc AND
     p1.prolang = 12 AND p2.prolang = 12 AND
-    NOT p1.proisagg AND NOT p2.proisagg AND
+    p1.prokind != 'a' AND p2.prokind != 'a' AND
     (p1.proargtypes[3] < p2.proargtypes[3])
 ORDER BY 1, 2;
 
@@ -194,7 +222,7 @@ FROM pg_proc AS p1, pg_proc AS p2
 WHERE p1.oid != p2.oid AND
     p1.prosrc = p2.prosrc AND
     p1.prolang = 12 AND p2.prolang = 12 AND
-    NOT p1.proisagg AND NOT p2.proisagg AND
+    p1.prokind != 'a' AND p2.prokind != 'a' AND
     (p1.proargtypes[4] < p2.proargtypes[4])
 ORDER BY 1, 2;
 
@@ -203,7 +231,7 @@ FROM pg_proc AS p1, pg_proc AS p2
 WHERE p1.oid != p2.oid AND
     p1.prosrc = p2.prosrc AND
     p1.prolang = 12 AND p2.prolang = 12 AND
-    NOT p1.proisagg AND NOT p2.proisagg AND
+    p1.prokind != 'a' AND p2.prokind != 'a' AND
     (p1.proargtypes[5] < p2.proargtypes[5])
 ORDER BY 1, 2;
 
@@ -212,7 +240,7 @@ FROM pg_proc AS p1, pg_proc AS p2
 WHERE p1.oid != p2.oid AND
     p1.prosrc = p2.prosrc AND
     p1.prolang = 12 AND p2.prolang = 12 AND
-    NOT p1.proisagg AND NOT p2.proisagg AND
+    p1.prokind != 'a' AND p2.prokind != 'a' AND
     (p1.proargtypes[6] < p2.proargtypes[6])
 ORDER BY 1, 2;
 
@@ -221,16 +249,15 @@ FROM pg_proc AS p1, pg_proc AS p2
 WHERE p1.oid != p2.oid AND
     p1.prosrc = p2.prosrc AND
     p1.prolang = 12 AND p2.prolang = 12 AND
-    NOT p1.proisagg AND NOT p2.proisagg AND
+    p1.prokind != 'a' AND p2.prokind != 'a' AND
     (p1.proargtypes[7] < p2.proargtypes[7])
 ORDER BY 1, 2;
 
 -- Look for functions that return type "internal" and do not have any
 -- "internal" argument.  Such a function would be a security hole since
 -- it might be used to call an internal function from an SQL command.
--- As of 7.3 this query should find internal_in, and as of 9.6 aggregate
--- deserialization will be found too. These should contain a runtime check to
--- ensure they can only be called in an aggregate context.
+-- As of 7.3 this query should find only internal_in, which is safe because
+-- it always throws an error when called.
 
 SELECT p1.oid, p1.proname
 FROM pg_proc as p1
@@ -381,6 +408,11 @@ where proname in (
 and pronamespace = (select oid from pg_catalog.pg_namespace
                     where nspname = 'pg_catalog')
 order by 1;
+
+-- Check that all immutable functions are marked parallel safe
+SELECT p1.oid, p1.proname
+FROM pg_proc AS p1
+WHERE provolatile = 'i' AND proparallel = 'u';
 
 
 -- **************** pg_cast ****************
@@ -713,7 +745,7 @@ WHERE d.classoid IS NULL AND p1.oid <= 9999;
 
 -- Check that operators' underlying functions have suitable comments,
 -- namely 'implementation of XXX operator'.  (Note: it's not necessary to
--- put such comments into pg_proc.h; initdb will generate them as needed.)
+-- put such comments into pg_proc.dat; initdb will generate them as needed.)
 -- In some cases involving legacy names for operators, there are multiple
 -- operators referencing the same pg_proc entry, so ignore operators whose
 -- comments say they are deprecated.
@@ -721,10 +753,14 @@ WHERE d.classoid IS NULL AND p1.oid <= 9999;
 -- be called directly; those should have comments matching their operator.
 WITH funcdescs AS (
   SELECT p.oid as p_oid, proname, o.oid as o_oid,
-    obj_description(p.oid, 'pg_proc') as prodesc,
+    pd.description as prodesc,
     'implementation of ' || oprname || ' operator' as expecteddesc,
-    obj_description(o.oid, 'pg_operator') as oprdesc
+    od.description as oprdesc
   FROM pg_proc p JOIN pg_operator o ON oprcode = p.oid
+       LEFT JOIN pg_description pd ON
+         (pd.objoid = p.oid and pd.classoid = p.tableoid and pd.objsubid = 0)
+       LEFT JOIN pg_description od ON
+         (od.objoid = o.oid and od.classoid = o.tableoid and od.objsubid = 0)
   WHERE o.oid <= 9999
 )
 SELECT * FROM funcdescs
@@ -738,10 +774,14 @@ SELECT * FROM funcdescs
 -- This should be a pretty short list; it's mostly legacy cases.
 WITH funcdescs AS (
   SELECT p.oid as p_oid, proname, o.oid as o_oid,
-    obj_description(p.oid, 'pg_proc') as prodesc,
+    pd.description as prodesc,
     'implementation of ' || oprname || ' operator' as expecteddesc,
-    obj_description(o.oid, 'pg_operator') as oprdesc
+    od.description as oprdesc
   FROM pg_proc p JOIN pg_operator o ON oprcode = p.oid
+       LEFT JOIN pg_description pd ON
+         (pd.objoid = p.oid and pd.classoid = p.tableoid and pd.objsubid = 0)
+       LEFT JOIN pg_description od ON
+         (od.objoid = o.oid and od.classoid = o.tableoid and od.objsubid = 0)
   WHERE o.oid <= 9999
 )
 SELECT p_oid, proname, prodesc FROM funcdescs
@@ -760,6 +800,8 @@ WHERE aggfnoid = 0 OR aggtransfn = 0 OR
     aggkind NOT IN ('n', 'o', 'h') OR
     aggnumdirectargs < 0 OR
     (aggkind = 'n' AND aggnumdirectargs > 0) OR
+    aggfinalmodify NOT IN ('r', 's', 'w') OR
+    aggmfinalmodify NOT IN ('r', 's', 'w') OR
     aggtranstype = 0 OR aggtransspace < 0 OR aggmtransspace < 0;
 
 -- Make sure the matching pg_proc entry is sensible, too.
@@ -767,13 +809,13 @@ WHERE aggfnoid = 0 OR aggtransfn = 0 OR
 SELECT a.aggfnoid::oid, p.proname
 FROM pg_aggregate as a, pg_proc as p
 WHERE a.aggfnoid = p.oid AND
-    (NOT p.proisagg OR p.proretset OR p.pronargs < a.aggnumdirectargs);
+    (p.prokind != 'a' OR p.proretset OR p.pronargs < a.aggnumdirectargs);
 
--- Make sure there are no proisagg pg_proc entries without matches.
+-- Make sure there are no prokind = PROKIND_AGGREGATE pg_proc entries without matches.
 
 SELECT oid, proname
 FROM pg_proc as p
-WHERE p.proisagg AND
+WHERE p.prokind = 'a' AND
     NOT EXISTS (SELECT 1 FROM pg_aggregate a WHERE a.aggfnoid = p.oid);
 
 -- If there is no finalfn then the output type must be the transtype.
@@ -784,8 +826,6 @@ WHERE a.aggfnoid = p.oid AND
     a.aggfinalfn = 0 AND p.prorettype != a.aggtranstype;
 
 -- Cross-check transfn against its entry in pg_proc.
--- NOTE: use physically_coercible here, not binary_coercible, because
--- max and min on abstime are implemented using int4larger/int4smaller.
 SELECT a.aggfnoid::oid, p.proname, ptr.oid, ptr.proname
 FROM pg_aggregate AS a, pg_proc AS p, pg_proc AS ptr
 WHERE a.aggfnoid = p.oid AND
@@ -794,15 +834,16 @@ WHERE a.aggfnoid = p.oid AND
      OR NOT (ptr.pronargs =
              CASE WHEN a.aggkind = 'n' THEN p.pronargs + 1
              ELSE greatest(p.pronargs - a.aggnumdirectargs, 1) + 1 END)
-     OR NOT physically_coercible(ptr.prorettype, a.aggtranstype)
-     OR NOT physically_coercible(a.aggtranstype, ptr.proargtypes[0])
+     OR NOT binary_coercible(ptr.prorettype, a.aggtranstype)
+     OR NOT binary_coercible(a.aggtranstype, ptr.proargtypes[0])
      OR (p.pronargs > 0 AND
-         NOT physically_coercible(p.proargtypes[0], ptr.proargtypes[1]))
+         NOT binary_coercible(p.proargtypes[0], ptr.proargtypes[1]))
      OR (p.pronargs > 1 AND
-         NOT physically_coercible(p.proargtypes[1], ptr.proargtypes[2]))
+         NOT binary_coercible(p.proargtypes[1], ptr.proargtypes[2]))
      OR (p.pronargs > 2 AND
-         NOT physically_coercible(p.proargtypes[2], ptr.proargtypes[3]))
+         NOT binary_coercible(p.proargtypes[2], ptr.proargtypes[3]))
      -- we could carry the check further, but 3 args is enough for now
+     OR (p.pronargs > 3)
     );
 
 -- Cross-check finalfn (if present) against its entry in pg_proc.
@@ -822,7 +863,8 @@ WHERE a.aggfnoid = p.oid AND
          NOT binary_coercible(p.proargtypes[1], pfn.proargtypes[2]))
      OR (pfn.pronargs > 3 AND
          NOT binary_coercible(p.proargtypes[2], pfn.proargtypes[3]))
-     -- we could carry the check further, but 3 args is enough for now
+     -- we could carry the check further, but 4 args is enough for now
+     OR (pfn.pronargs > 4)
     );
 
 -- If transfn is strict then either initval should be non-NULL, or
@@ -866,15 +908,16 @@ WHERE a.aggfnoid = p.oid AND
      OR NOT (ptr.pronargs =
              CASE WHEN a.aggkind = 'n' THEN p.pronargs + 1
              ELSE greatest(p.pronargs - a.aggnumdirectargs, 1) + 1 END)
-     OR NOT physically_coercible(ptr.prorettype, a.aggmtranstype)
-     OR NOT physically_coercible(a.aggmtranstype, ptr.proargtypes[0])
+     OR NOT binary_coercible(ptr.prorettype, a.aggmtranstype)
+     OR NOT binary_coercible(a.aggmtranstype, ptr.proargtypes[0])
      OR (p.pronargs > 0 AND
-         NOT physically_coercible(p.proargtypes[0], ptr.proargtypes[1]))
+         NOT binary_coercible(p.proargtypes[0], ptr.proargtypes[1]))
      OR (p.pronargs > 1 AND
-         NOT physically_coercible(p.proargtypes[1], ptr.proargtypes[2]))
+         NOT binary_coercible(p.proargtypes[1], ptr.proargtypes[2]))
      OR (p.pronargs > 2 AND
-         NOT physically_coercible(p.proargtypes[2], ptr.proargtypes[3]))
+         NOT binary_coercible(p.proargtypes[2], ptr.proargtypes[3]))
      -- we could carry the check further, but 3 args is enough for now
+     OR (p.pronargs > 3)
     );
 
 -- Cross-check minvtransfn (if present) against its entry in pg_proc.
@@ -886,15 +929,16 @@ WHERE a.aggfnoid = p.oid AND
      OR NOT (ptr.pronargs =
              CASE WHEN a.aggkind = 'n' THEN p.pronargs + 1
              ELSE greatest(p.pronargs - a.aggnumdirectargs, 1) + 1 END)
-     OR NOT physically_coercible(ptr.prorettype, a.aggmtranstype)
-     OR NOT physically_coercible(a.aggmtranstype, ptr.proargtypes[0])
+     OR NOT binary_coercible(ptr.prorettype, a.aggmtranstype)
+     OR NOT binary_coercible(a.aggmtranstype, ptr.proargtypes[0])
      OR (p.pronargs > 0 AND
-         NOT physically_coercible(p.proargtypes[0], ptr.proargtypes[1]))
+         NOT binary_coercible(p.proargtypes[0], ptr.proargtypes[1]))
      OR (p.pronargs > 1 AND
-         NOT physically_coercible(p.proargtypes[1], ptr.proargtypes[2]))
+         NOT binary_coercible(p.proargtypes[1], ptr.proargtypes[2]))
      OR (p.pronargs > 2 AND
-         NOT physically_coercible(p.proargtypes[2], ptr.proargtypes[3]))
+         NOT binary_coercible(p.proargtypes[2], ptr.proargtypes[3]))
      -- we could carry the check further, but 3 args is enough for now
+     OR (p.pronargs > 3)
     );
 
 -- Cross-check mfinalfn (if present) against its entry in pg_proc.
@@ -914,7 +958,8 @@ WHERE a.aggfnoid = p.oid AND
          NOT binary_coercible(p.proargtypes[1], pfn.proargtypes[2]))
      OR (pfn.pronargs > 3 AND
          NOT binary_coercible(p.proargtypes[2], pfn.proargtypes[3]))
-     -- we could carry the check further, but 3 args is enough for now
+     -- we could carry the check further, but 4 args is enough for now
+     OR (pfn.pronargs > 4)
     );
 
 -- If mtransfn is strict then either minitval should be non-NULL, or
@@ -936,6 +981,70 @@ WHERE a.aggfnoid = p.oid AND
     a.aggmtransfn = ptr.oid AND
     a.aggminvtransfn = iptr.oid AND
     ptr.proisstrict != iptr.proisstrict;
+
+-- Check that all combine functions have signature
+-- combine(transtype, transtype) returns transtype
+
+SELECT a.aggfnoid, p.proname
+FROM pg_aggregate as a, pg_proc as p
+WHERE a.aggcombinefn = p.oid AND
+    (p.pronargs != 2 OR
+     p.prorettype != p.proargtypes[0] OR
+     p.prorettype != p.proargtypes[1] OR
+     NOT binary_coercible(a.aggtranstype, p.proargtypes[0]));
+
+-- Check that no combine function for an INTERNAL transtype is strict.
+
+SELECT a.aggfnoid, p.proname
+FROM pg_aggregate as a, pg_proc as p
+WHERE a.aggcombinefn = p.oid AND
+    a.aggtranstype = 'internal'::regtype AND p.proisstrict;
+
+-- serialize/deserialize functions should be specified only for aggregates
+-- with transtype internal and a combine function, and we should have both
+-- or neither of them.
+
+SELECT aggfnoid, aggtranstype, aggserialfn, aggdeserialfn
+FROM pg_aggregate
+WHERE (aggserialfn != 0 OR aggdeserialfn != 0)
+  AND (aggtranstype != 'internal'::regtype OR aggcombinefn = 0 OR
+       aggserialfn = 0 OR aggdeserialfn = 0);
+
+-- Check that all serialization functions have signature
+-- serialize(internal) returns bytea
+-- Also insist that they be strict; it's wasteful to run them on NULLs.
+
+SELECT a.aggfnoid, p.proname
+FROM pg_aggregate as a, pg_proc as p
+WHERE a.aggserialfn = p.oid AND
+    (p.prorettype != 'bytea'::regtype OR p.pronargs != 1 OR
+     p.proargtypes[0] != 'internal'::regtype OR
+     NOT p.proisstrict);
+
+-- Check that all deserialization functions have signature
+-- deserialize(bytea, internal) returns internal
+-- Also insist that they be strict; it's wasteful to run them on NULLs.
+
+SELECT a.aggfnoid, p.proname
+FROM pg_aggregate as a, pg_proc as p
+WHERE a.aggdeserialfn = p.oid AND
+    (p.prorettype != 'internal'::regtype OR p.pronargs != 2 OR
+     p.proargtypes[0] != 'bytea'::regtype OR
+     p.proargtypes[1] != 'internal'::regtype OR
+     NOT p.proisstrict);
+
+-- Check that aggregates which have the same transition function also have
+-- the same combine, serialization, and deserialization functions.
+-- While that isn't strictly necessary, it's fishy if they don't.
+
+SELECT a.aggfnoid, a.aggcombinefn, a.aggserialfn, a.aggdeserialfn,
+       b.aggfnoid, b.aggcombinefn, b.aggserialfn, b.aggdeserialfn
+FROM
+    pg_aggregate a, pg_aggregate b
+WHERE
+    a.aggfnoid < b.aggfnoid AND a.aggtransfn = b.aggtransfn AND
+    (a.aggcombinefn != b.aggcombinefn OR a.aggserialfn != b.aggserialfn
+     OR a.aggdeserialfn != b.aggdeserialfn);
 
 -- Cross-check aggsortop (if present) against pg_operator.
 -- We expect to find entries for bool_and, bool_or, every, max, and min.
@@ -986,7 +1095,7 @@ ORDER BY 1, 2;
 SELECT p1.oid::regprocedure, p2.oid::regprocedure
 FROM pg_proc AS p1, pg_proc AS p2
 WHERE p1.oid < p2.oid AND p1.proname = p2.proname AND
-    p1.proisagg AND p2.proisagg AND
+    p1.prokind = 'a' AND p2.prokind = 'a' AND
     array_dims(p1.proargtypes) != array_dims(p2.proargtypes)
 ORDER BY 1;
 
@@ -994,7 +1103,7 @@ ORDER BY 1;
 
 SELECT oid, proname
 FROM pg_proc AS p
-WHERE proisagg AND proargdefaults IS NOT NULL;
+WHERE prokind = 'a' AND proargdefaults IS NOT NULL;
 
 -- For the same reason, we avoid creating built-in variadic aggregates, except
 -- that variadic ordered-set aggregates are OK (since they have special syntax
@@ -1002,66 +1111,8 @@ WHERE proisagg AND proargdefaults IS NOT NULL;
 
 SELECT p.oid, proname
 FROM pg_proc AS p JOIN pg_aggregate AS a ON a.aggfnoid = p.oid
-WHERE proisagg AND provariadic != 0 AND a.aggkind = 'n';
+WHERE prokind = 'a' AND provariadic != 0 AND a.aggkind = 'n';
 
--- Check that all serial functions have a return type the same as the serial
--- type.
-SELECT a.aggserialfn,a.aggserialtype,p.prorettype
-FROM pg_aggregate a
-INNER JOIN pg_proc p ON a.aggserialfn = p.oid
-WHERE a.aggserialtype <> p.prorettype;
-
--- Check that all the deserial functions have the same input type as the
--- serialtype
-SELECT a.aggserialfn,a.aggserialtype,p.proargtypes[0]
-FROM pg_aggregate a
-INNER JOIN pg_proc p ON a.aggdeserialfn = p.oid
-WHERE p.proargtypes[0] <> a.aggserialtype;
-
--- An aggregate should either have a complete set of serialtype, serial func
--- and deserial func, or none of them.
-SELECT aggserialtype,aggserialfn,aggdeserialfn
-FROM pg_aggregate
-WHERE (aggserialtype <> 0 OR aggserialfn <> 0 OR aggdeserialfn <> 0)
-  AND (aggserialtype = 0 OR aggserialfn = 0 OR aggdeserialfn = 0);
-
--- Check that all aggregates with serialtypes have internal states.
--- (There's no point in serializing anything apart from internal)
-SELECT aggfnoid,aggserialtype,aggtranstype
-FROM pg_aggregate
-WHERE aggserialtype <> 0 AND aggtranstype <> 'internal'::regtype;
-
--- Check that all serial functions are strict. It's wasteful for these to be
--- called with NULL values.
-SELECT aggfnoid,aggserialfn
-FROM pg_aggregate a
-INNER JOIN pg_proc p ON a.aggserialfn = p.oid
-WHERE p.proisstrict = false;
-
--- Check that all deserial functions are strict. It's wasteful for these to be
--- called with NULL values.
-SELECT aggfnoid,aggdeserialfn
-FROM pg_aggregate a
-INNER JOIN pg_proc p ON a.aggdeserialfn = p.oid
-WHERE p.proisstrict = false;
-
--- Check that no combine functions with an INTERNAL return type are strict.
-SELECT aggfnoid,aggcombinefn
-FROM pg_aggregate a
-INNER JOIN pg_proc p ON a.aggcombinefn = p.oid
-INNER JOIN pg_type t ON a.aggtranstype = t.oid
-WHERE t.typname = 'internal' AND p.proisstrict = true;
-
--- Check that aggregates which have the same transition function also have
--- the same combine, serialization, and deserialization functions.
-SELECT a.aggfnoid, a.aggcombinefn, a.aggserialfn, a.aggdeserialfn,
-       b.aggfnoid, b.aggcombinefn, b.aggserialfn, b.aggdeserialfn
-FROM
-    pg_aggregate a, pg_aggregate b
-WHERE
-    a.aggfnoid < b.aggfnoid AND a.aggtransfn = b.aggtransfn AND
-    (a.aggcombinefn != b.aggcombinefn OR a.aggserialfn != b.aggserialfn
-     OR a.aggdeserialfn != b.aggdeserialfn);
 
 -- **************** pg_opfamily ****************
 
@@ -1070,6 +1121,14 @@ WHERE
 SELECT p1.oid
 FROM pg_opfamily as p1
 WHERE p1.opfmethod = 0 OR p1.opfnamespace = 0;
+
+-- Look for opfamilies having no opclasses.  While most validation of
+-- opfamilies is now handled by AM-specific amvalidate functions, that's
+-- driven from pg_opclass entries below, so an empty opfamily would not
+-- get noticed.
+
+SELECT oid, opfname FROM pg_opfamily f
+WHERE NOT EXISTS (SELECT 1 FROM pg_opclass WHERE opcfamily = f.oid);
 
 
 -- **************** pg_opclass ****************

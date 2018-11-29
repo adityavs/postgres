@@ -4,7 +4,7 @@
  *	 Implementation of generic xlog records.
  *
  *
- * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/backend/access/transam/generic_xlog.c
@@ -13,6 +13,7 @@
  */
 #include "postgres.h"
 
+#include "access/bufmask.h"
 #include "access/generic_xlog.h"
 #include "access/xlogutils.h"
 #include "miscadmin.h"
@@ -52,15 +53,19 @@ typedef struct
 	Buffer		buffer;			/* registered buffer */
 	int			flags;			/* flags for this buffer */
 	int			deltaLen;		/* space consumed in delta field */
-	char		image[BLCKSZ];	/* copy of page image for modification */
+	char	   *image;			/* copy of page image for modification, do not
+								 * do it in-place to have aligned memory chunk */
 	char		delta[MAX_DELTA_SIZE];	/* delta between page images */
 } PageData;
 
 /* State of generic xlog record construction */
 struct GenericXLogState
 {
-	bool		isLogged;
+	/* Info about each page, see above */
 	PageData	pages[MAX_GENERIC_XLOG_PAGES];
+	bool		isLogged;
+	/* Page images (properly aligned) */
+	PGAlignedBlock images[MAX_GENERIC_XLOG_PAGES];
 };
 
 static void writeFragment(PageData *pageData, OffsetNumber offset,
@@ -243,12 +248,12 @@ computeDelta(PageData *pageData, Page curpage, Page targetpage)
 #ifdef WAL_DEBUG
 	if (XLOG_DEBUG)
 	{
-		char		tmp[BLCKSZ];
+		PGAlignedBlock tmp;
 
-		memcpy(tmp, curpage, BLCKSZ);
-		applyPageRedo(tmp, pageData->delta, pageData->deltaLen);
-		if (memcmp(tmp, targetpage, targetLower) != 0 ||
-			memcmp(tmp + targetUpper, targetpage + targetUpper,
+		memcpy(tmp.data, curpage, BLCKSZ);
+		applyPageRedo(tmp.data, pageData->delta, pageData->deltaLen);
+		if (memcmp(tmp.data, targetpage, targetLower) != 0 ||
+			memcmp(tmp.data + targetUpper, targetpage + targetUpper,
 				   BLCKSZ - targetUpper) != 0)
 			elog(ERROR, "result of generic xlog apply does not match");
 	}
@@ -265,10 +270,13 @@ GenericXLogStart(Relation relation)
 	int			i;
 
 	state = (GenericXLogState *) palloc(sizeof(GenericXLogState));
-
 	state->isLogged = RelationNeedsWAL(relation);
+
 	for (i = 0; i < MAX_GENERIC_XLOG_PAGES; i++)
+	{
+		state->pages[i].image = state->images[i].data;
 		state->pages[i].buffer = InvalidBuffer;
+	}
 
 	return state;
 }
@@ -298,9 +306,7 @@ GenericXLogRegisterBuffer(GenericXLogState *state, Buffer buffer, int flags)
 			/* Empty slot, so use it (there cannot be a match later) */
 			page->buffer = buffer;
 			page->flags = flags;
-			memcpy(page->image,
-				   BufferGetPage(buffer, NULL, NULL, BGP_NO_SNAPSHOT_TEST),
-				   BLCKSZ);
+			memcpy(page->image, BufferGetPage(buffer), BLCKSZ);
 			return (Page) page->image;
 		}
 		else if (page->buffer == buffer)
@@ -345,8 +351,7 @@ GenericXLogFinish(GenericXLogState *state)
 			if (BufferIsInvalid(pageData->buffer))
 				continue;
 
-			page = BufferGetPage(pageData->buffer, NULL, NULL,
-								 BGP_NO_SNAPSHOT_TEST);
+			page = BufferGetPage(pageData->buffer);
 			pageHeader = (PageHeader) pageData->image;
 
 			if (pageData->flags & GENERIC_XLOG_FULL_IMAGE)
@@ -399,8 +404,7 @@ GenericXLogFinish(GenericXLogState *state)
 
 			if (BufferIsInvalid(pageData->buffer))
 				continue;
-			PageSetLSN(BufferGetPage(pageData->buffer, NULL, NULL,
-									 BGP_NO_SNAPSHOT_TEST), lsn);
+			PageSetLSN(BufferGetPage(pageData->buffer), lsn);
 			MarkBufferDirty(pageData->buffer);
 		}
 		END_CRIT_SECTION();
@@ -415,8 +419,7 @@ GenericXLogFinish(GenericXLogState *state)
 
 			if (BufferIsInvalid(pageData->buffer))
 				continue;
-			memcpy(BufferGetPage(pageData->buffer, NULL, NULL,
-								 BGP_NO_SNAPSHOT_TEST),
+			memcpy(BufferGetPage(pageData->buffer),
 				   pageData->image,
 				   BLCKSZ);
 			/* We don't worry about zeroing the "hole" in this case */
@@ -502,8 +505,7 @@ generic_redo(XLogReaderState *record)
 			char	   *blockDelta;
 			Size		blockDeltaSize;
 
-			page = BufferGetPage(buffers[block_id], NULL, NULL,
-								 BGP_NO_SNAPSHOT_TEST);
+			page = BufferGetPage(buffers[block_id]);
 			blockDelta = XLogRecGetBlockData(record, block_id, &blockDeltaSize);
 			applyPageRedo(page, blockDelta, blockDeltaSize);
 
@@ -528,4 +530,15 @@ generic_redo(XLogReaderState *record)
 		if (BufferIsValid(buffers[block_id]))
 			UnlockReleaseBuffer(buffers[block_id]);
 	}
+}
+
+/*
+ * Mask a generic page before performing consistency checks on it.
+ */
+void
+generic_mask(char *page, BlockNumber blkno)
+{
+	mask_page_lsn_and_checksum(page);
+
+	mask_unused_space(page);
 }

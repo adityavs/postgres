@@ -3,7 +3,7 @@
  * pg_largeobject.c
  *	  routines to support manipulation of the pg_largeobject relation
  *
- * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -18,6 +18,7 @@
 #include "access/heapam.h"
 #include "access/htup_details.h"
 #include "access/sysattr.h"
+#include "catalog/catalog.h"
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
 #include "catalog/pg_largeobject.h"
@@ -54,19 +55,22 @@ LargeObjectCreate(Oid loid)
 	memset(values, 0, sizeof(values));
 	memset(nulls, false, sizeof(nulls));
 
+	if (OidIsValid(loid))
+		loid_new = loid;
+	else
+		loid_new = GetNewOidWithIndex(pg_lo_meta,
+									  LargeObjectMetadataOidIndexId,
+									  Anum_pg_largeobject_metadata_oid);
+
+	values[Anum_pg_largeobject_metadata_oid - 1] = ObjectIdGetDatum(loid_new);
 	values[Anum_pg_largeobject_metadata_lomowner - 1]
 		= ObjectIdGetDatum(GetUserId());
 	nulls[Anum_pg_largeobject_metadata_lomacl - 1] = true;
 
 	ntup = heap_form_tuple(RelationGetDescr(pg_lo_meta),
 						   values, nulls);
-	if (OidIsValid(loid))
-		HeapTupleSetOid(ntup, loid);
 
-	loid_new = simple_heap_insert(pg_lo_meta, ntup);
-	Assert(!OidIsValid(loid) || loid == loid_new);
-
-	CatalogUpdateIndexes(pg_lo_meta, ntup);
+	CatalogTupleInsert(pg_lo_meta, ntup);
 
 	heap_freetuple(ntup);
 
@@ -98,7 +102,7 @@ LargeObjectDrop(Oid loid)
 	 * Delete an entry from pg_largeobject_metadata
 	 */
 	ScanKeyInit(&skey[0],
-				ObjectIdAttributeNumber,
+				Anum_pg_largeobject_metadata_oid,
 				BTEqualStrategyNumber, F_OIDEQ,
 				ObjectIdGetDatum(loid));
 
@@ -112,7 +116,7 @@ LargeObjectDrop(Oid loid)
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
 				 errmsg("large object %u does not exist", loid)));
 
-	simple_heap_delete(pg_lo_meta, &tuple->t_self);
+	CatalogTupleDelete(pg_lo_meta, &tuple->t_self);
 
 	systable_endscan(scan);
 
@@ -129,7 +133,7 @@ LargeObjectDrop(Oid loid)
 							  NULL, 1, skey);
 	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
 	{
-		simple_heap_delete(pg_largeobject, &tuple->t_self);
+		CatalogTupleDelete(pg_largeobject, &tuple->t_self);
 	}
 
 	systable_endscan(scan);
@@ -161,7 +165,7 @@ LargeObjectExists(Oid loid)
 	bool		retval = false;
 
 	ScanKeyInit(&skey[0],
-				ObjectIdAttributeNumber,
+				Anum_pg_largeobject_metadata_oid,
 				BTEqualStrategyNumber, F_OIDEQ,
 				ObjectIdGetDatum(loid));
 

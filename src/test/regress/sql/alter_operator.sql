@@ -81,17 +81,20 @@ ALTER OPERATOR === (boolean, boolean) SET (JOIN = non_existent_func);
 ALTER OPERATOR === (boolean, boolean) SET (COMMUTATOR = !==);
 ALTER OPERATOR === (boolean, boolean) SET (NEGATOR = !==);
 
+-- invalid: non-lowercase quoted identifiers
+ALTER OPERATOR & (bit, bit) SET ("Restrict" = _int_contsel, "Join" = _int_contjoinsel);
+
 --
 -- Test permission check. Must be owner to ALTER OPERATOR.
 --
-CREATE USER regtest_alter_user;
-SET SESSION AUTHORIZATION regtest_alter_user;
+CREATE USER regress_alter_op_user;
+SET SESSION AUTHORIZATION regress_alter_op_user;
 
 ALTER OPERATOR === (boolean, boolean) SET (RESTRICT = NONE);
 
 -- Clean up
 RESET SESSION AUTHORIZATION;
-DROP USER regtest_alter_user;
+DROP USER regress_alter_op_user;
 DROP OPERATOR === (boolean, boolean);
 DROP FUNCTION customcontsel(internal, oid, internal, integer);
 DROP FUNCTION alter_op_test_fn(boolean, boolean);

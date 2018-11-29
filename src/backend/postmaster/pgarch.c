@@ -14,7 +14,7 @@
  *
  *	Initial author: Simon Riggs		simon@2ndquadrant.com
  *
- * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -54,11 +54,10 @@
  * Timer definitions.
  * ----------
  */
-#define PGARCH_AUTOWAKE_INTERVAL 60		/* How often to force a poll of the
-										 * archive status directory; in
-										 * seconds. */
-#define PGARCH_RESTART_INTERVAL 10		/* How often to attempt to restart a
-										 * failed archiver; in seconds. */
+#define PGARCH_AUTOWAKE_INTERVAL 60 /* How often to force a poll of the
+									 * archive status directory; in seconds. */
+#define PGARCH_RESTART_INTERVAL 10	/* How often to attempt to restart a
+									 * failed archiver; in seconds. */
 
 #define NUM_ARCHIVE_RETRIES 3
 
@@ -203,7 +202,7 @@ pgarch_forkexec(void)
 
 	return postmaster_forkexec(ac, av);
 }
-#endif   /* EXEC_BACKEND */
+#endif							/* EXEC_BACKEND */
 
 
 /*
@@ -227,17 +226,14 @@ PgArchiverMain(int argc, char *argv[])
 	pqsignal(SIGPIPE, SIG_IGN);
 	pqsignal(SIGUSR1, pgarch_waken);
 	pqsignal(SIGUSR2, pgarch_waken_stop);
+	/* Reset some signals that are accepted by postmaster but not here */
 	pqsignal(SIGCHLD, SIG_DFL);
-	pqsignal(SIGTTIN, SIG_DFL);
-	pqsignal(SIGTTOU, SIG_DFL);
-	pqsignal(SIGCONT, SIG_DFL);
-	pqsignal(SIGWINCH, SIG_DFL);
 	PG_SETMASK(&UnBlockSig);
 
 	/*
 	 * Identify myself via ps
 	 */
-	init_ps_display("archiver process", "", "", "");
+	init_ps_display("archiver", "", "", "");
 
 	pgarch_MainLoop();
 
@@ -389,10 +385,13 @@ pgarch_MainLoop(void)
 				int			rc;
 
 				rc = WaitLatch(MyLatch,
-							 WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH,
-							   timeout * 1000L);
+							   WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH,
+							   timeout * 1000L,
+							   WAIT_EVENT_ARCHIVER_MAIN);
 				if (rc & WL_TIMEOUT)
 					wakened = true;
+				if (rc & WL_POSTMASTER_DEATH)
+					time_to_stop = true;
 			}
 			else
 				wakened = true;
@@ -403,7 +402,7 @@ pgarch_MainLoop(void)
 		 * or after completing one more archiving cycle after receiving
 		 * SIGUSR2.
 		 */
-	} while (PostmasterIsAlive() && !time_to_stop);
+	} while (!time_to_stop);
 }
 
 /*
@@ -481,7 +480,7 @@ pgarch_ArchiverCopyLoop(void)
 				if (++failures >= NUM_ARCHIVE_RETRIES)
 				{
 					ereport(WARNING,
-							(errmsg("archiving transaction log file \"%s\" failed too many times, will try again later",
+							(errmsg("archiving write-ahead log file \"%s\" failed too many times, will try again later",
 									xlog)));
 					return;		/* give up archiving for now */
 				}
@@ -593,16 +592,16 @@ pgarch_archiveXlog(char *xlog)
 		{
 #if defined(WIN32)
 			ereport(lev,
-				  (errmsg("archive command was terminated by exception 0x%X",
-						  WTERMSIG(rc)),
-				   errhint("See C include file \"ntstatus.h\" for a description of the hexadecimal value."),
-				   errdetail("The failed archive command was: %s",
-							 xlogarchcmd)));
+					(errmsg("archive command was terminated by exception 0x%X",
+							WTERMSIG(rc)),
+					 errhint("See C include file \"ntstatus.h\" for a description of the hexadecimal value."),
+					 errdetail("The failed archive command was: %s",
+							   xlogarchcmd)));
 #elif defined(HAVE_DECL_SYS_SIGLIST) && HAVE_DECL_SYS_SIGLIST
 			ereport(lev,
 					(errmsg("archive command was terminated by signal %d: %s",
 							WTERMSIG(rc),
-			  WTERMSIG(rc) < NSIG ? sys_siglist[WTERMSIG(rc)] : "(unknown)"),
+							WTERMSIG(rc) < NSIG ? sys_siglist[WTERMSIG(rc)] : "(unknown)"),
 					 errdetail("The failed archive command was: %s",
 							   xlogarchcmd)));
 #else
@@ -616,10 +615,10 @@ pgarch_archiveXlog(char *xlog)
 		else
 		{
 			ereport(lev,
-				(errmsg("archive command exited with unrecognized status %d",
-						rc),
-				 errdetail("The failed archive command was: %s",
-						   xlogarchcmd)));
+					(errmsg("archive command exited with unrecognized status %d",
+							rc),
+					 errdetail("The failed archive command was: %s",
+							   xlogarchcmd)));
 		}
 
 		snprintf(activitymsg, sizeof(activitymsg), "failed on %s", xlog);
@@ -627,8 +626,7 @@ pgarch_archiveXlog(char *xlog)
 
 		return false;
 	}
-	ereport(DEBUG1,
-			(errmsg("archived transaction log file \"%s\"", xlog)));
+	elog(DEBUG1, "archived write-ahead log file \"%s\"", xlog);
 
 	snprintf(activitymsg, sizeof(activitymsg), "last was %s", xlog);
 	set_ps_display(activitymsg, false);
@@ -674,11 +672,6 @@ pgarch_readyXlog(char *xlog)
 
 	snprintf(XLogArchiveStatusDir, MAXPGPATH, XLOGDIR "/archive_status");
 	rldir = AllocateDir(XLogArchiveStatusDir);
-	if (rldir == NULL)
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not open archive status directory \"%s\": %m",
-						XLogArchiveStatusDir)));
 
 	while ((rlde = ReadDir(rldir, XLogArchiveStatusDir)) != NULL)
 	{

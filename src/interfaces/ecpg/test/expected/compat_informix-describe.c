@@ -41,7 +41,7 @@ typedef struct sqlda_struct sqlda_t;
 
 #endif
 
-#endif   /* ECPG_SQLDA_H */
+#endif							/* ECPG_SQLDA_H */
 
 #line 5 "describe.pgc"
 
@@ -85,7 +85,7 @@ main (void)
 	ECPGdebug(1, stderr);
 
 	strcpy(msg, "connect");
-	{ ECPGconnect(__LINE__, 1, "regress1" , NULL, NULL , NULL, 0); 
+	{ ECPGconnect(__LINE__, 1, "ecpg1_regression" , NULL, NULL , NULL, 0); 
 #line 27 "describe.pgc"
 
 if (sqlca.sqlcode < 0) exit (1);}
@@ -463,5 +463,5 @@ if (sqlca.sqlcode < 0) exit (1);}
 #line 196 "describe.pgc"
 
 
-	return (0);
+	return 0;
 }

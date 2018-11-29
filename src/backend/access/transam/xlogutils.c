@@ -2,13 +2,13 @@
  *
  * xlogutils.c
  *
- * PostgreSQL transaction log manager utility routines
+ * PostgreSQL write-ahead log manager utility routines
  *
  * This file contains support routines that are used by XLOG replay functions.
  * None of this code is used during normal system operation.
  *
  *
- * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/backend/access/transam/xlogutils.c
@@ -23,8 +23,8 @@
 #include "access/xlog.h"
 #include "access/xlog_internal.h"
 #include "access/xlogutils.h"
-#include "catalog/catalog.h"
 #include "miscadmin.h"
+#include "pgstat.h"
 #include "storage/smgr.h"
 #include "utils/guc.h"
 #include "utils/hsearch.h"
@@ -276,9 +276,9 @@ XLogCheckInvalidPages(void)
  * will complain if we don't have the lock.  In hot standby mode it's
  * definitely necessary.)
  *
- * Note: when a backup block is available in XLOG, we restore it
- * unconditionally, even if the page in the database appears newer.  This is
- * to protect ourselves against database pages that were partially or
+ * Note: when a backup block is available in XLOG with the BKPIMAGE_APPLY flag
+ * set, we restore it, even if the page in the database appears newer.  This
+ * is to protect ourselves against database pages that were partially or
  * incorrectly written during a crash.  We assume that the XLOG data must be
  * good because it has passed a CRC check, while the database page might not
  * be.  This will force us to replay all subsequent modifications of the page
@@ -353,12 +353,13 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
 	if (!willinit && zeromode)
 		elog(PANIC, "block to be initialized in redo routine must be marked with WILL_INIT flag in the WAL record");
 
-	/* If it's a full-page image, restore it. */
-	if (XLogRecHasBlockImage(record, block_id))
+	/* If it has a full-page image and it should be restored, do it. */
+	if (XLogRecBlockImageApply(record, block_id))
 	{
+		Assert(XLogRecHasBlockImage(record, block_id));
 		*buf = XLogReadBufferExtended(rnode, forknum, blkno,
-		   get_cleanup_lock ? RBM_ZERO_AND_CLEANUP_LOCK : RBM_ZERO_AND_LOCK);
-		page = BufferGetPage(*buf, NULL, NULL, BGP_NO_SNAPSHOT_TEST);
+									  get_cleanup_lock ? RBM_ZERO_AND_CLEANUP_LOCK : RBM_ZERO_AND_LOCK);
+		page = BufferGetPage(*buf);
 		if (!RestoreBlockImage(record, block_id, page))
 			elog(ERROR, "failed to restore block image");
 
@@ -396,8 +397,7 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
 				else
 					LockBuffer(*buf, BUFFER_LOCK_EXCLUSIVE);
 			}
-			if (lsn <= PageGetLSN(BufferGetPage(*buf, NULL, NULL,
-												BGP_NO_SNAPSHOT_TEST)))
+			if (lsn <= PageGetLSN(BufferGetPage(*buf)))
 				return BLK_DONE;
 			else
 				return BLK_NEEDS_REDO;
@@ -428,9 +428,10 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
  * to imply that the page should be dropped or truncated later.
  *
  * NB: A redo function should normally not call this directly. To get a page
- * to modify, use XLogReplayBuffer instead. It is important that all pages
- * modified by a WAL record are registered in the WAL records, or they will be
- * invisible to tools that that need to know which pages are modified.
+ * to modify, use XLogReadBufferForRedoExtended instead. It is important that
+ * all pages modified by a WAL record are registered in the WAL records, or
+ * they will be invisible to tools that that need to know which pages are
+ * modified.
  */
 Buffer
 XLogReadBufferExtended(RelFileNode rnode, ForkNumber forknum,
@@ -503,8 +504,7 @@ XLogReadBufferExtended(RelFileNode rnode, ForkNumber forknum,
 	if (mode == RBM_NORMAL)
 	{
 		/* check that page has been initialized */
-		Page		page = BufferGetPage(buffer, NULL, NULL,
-										 BGP_NO_SNAPSHOT_TEST);
+		Page		page = (Page) BufferGetPage(buffer);
 
 		/*
 		 * We assume that PageIsNew is safe without a lock. During recovery,
@@ -648,12 +648,13 @@ XLogTruncateRelation(RelFileNode rnode, ForkNumber forkNum,
  * always be one descriptor left open until the process ends, but never
  * more than one.
  *
- * XXX This is very similar to pg_xlogdump's XLogDumpXLogRead and to XLogRead
+ * XXX This is very similar to pg_waldump's XLogDumpXLogRead and to XLogRead
  * in walsender.c but for small differences (such as lack of elog() in
  * frontend).  Probably these should be merged at some point.
  */
 static void
-XLogRead(char *buf, TimeLineID tli, XLogRecPtr startptr, Size count)
+XLogRead(char *buf, int segsize, TimeLineID tli, XLogRecPtr startptr,
+		 Size count)
 {
 	char	   *p;
 	XLogRecPtr	recptr;
@@ -665,6 +666,8 @@ XLogRead(char *buf, TimeLineID tli, XLogRecPtr startptr, Size count)
 	static TimeLineID sendTLI = 0;
 	static uint32 sendOff = 0;
 
+	Assert(segsize == wal_segment_size);
+
 	p = buf;
 	recptr = startptr;
 	nbytes = count;
@@ -675,10 +678,10 @@ XLogRead(char *buf, TimeLineID tli, XLogRecPtr startptr, Size count)
 		int			segbytes;
 		int			readbytes;
 
-		startoff = recptr % XLogSegSize;
+		startoff = XLogSegmentOffset(recptr, segsize);
 
 		/* Do we need to switch to a different xlog segment? */
-		if (sendFile < 0 || !XLByteInSeg(recptr, sendSegNo) ||
+		if (sendFile < 0 || !XLByteInSeg(recptr, sendSegNo, segsize) ||
 			sendTLI != tli)
 		{
 			char		path[MAXPGPATH];
@@ -686,11 +689,11 @@ XLogRead(char *buf, TimeLineID tli, XLogRecPtr startptr, Size count)
 			if (sendFile >= 0)
 				close(sendFile);
 
-			XLByteToSeg(recptr, sendSegNo);
+			XLByteToSeg(recptr, sendSegNo, segsize);
 
-			XLogFilePath(path, tli, sendSegNo);
+			XLogFilePath(path, tli, sendSegNo, segsize);
 
-			sendFile = BasicOpenFile(path, O_RDONLY | PG_BINARY, 0);
+			sendFile = BasicOpenFile(path, O_RDONLY | PG_BINARY);
 
 			if (sendFile < 0)
 			{
@@ -715,30 +718,34 @@ XLogRead(char *buf, TimeLineID tli, XLogRecPtr startptr, Size count)
 			if (lseek(sendFile, (off_t) startoff, SEEK_SET) < 0)
 			{
 				char		path[MAXPGPATH];
+				int			save_errno = errno;
 
-				XLogFilePath(path, tli, sendSegNo);
-
+				XLogFilePath(path, tli, sendSegNo, segsize);
+				errno = save_errno;
 				ereport(ERROR,
 						(errcode_for_file_access(),
-				  errmsg("could not seek in log segment %s to offset %u: %m",
-						 path, startoff)));
+						 errmsg("could not seek in log segment %s to offset %u: %m",
+								path, startoff)));
 			}
 			sendOff = startoff;
 		}
 
 		/* How many bytes are within this segment? */
-		if (nbytes > (XLogSegSize - startoff))
-			segbytes = XLogSegSize - startoff;
+		if (nbytes > (segsize - startoff))
+			segbytes = segsize - startoff;
 		else
 			segbytes = nbytes;
 
+		pgstat_report_wait_start(WAIT_EVENT_WAL_READ);
 		readbytes = read(sendFile, p, segbytes);
+		pgstat_report_wait_end();
 		if (readbytes <= 0)
 		{
 			char		path[MAXPGPATH];
+			int			save_errno = errno;
 
-			XLogFilePath(path, tli, sendSegNo);
-
+			XLogFilePath(path, tli, sendSegNo, segsize);
+			errno = save_errno;
 			ereport(ERROR,
 					(errcode_for_file_access(),
 					 errmsg("could not read from log segment %s, offset %u, length %lu: %m",
@@ -755,10 +762,17 @@ XLogRead(char *buf, TimeLineID tli, XLogRecPtr startptr, Size count)
 }
 
 /*
- * Determine XLogReaderState->currTLI and ->currTLIValidUntil;
- * XLogReaderState->EndRecPtr, ->currRecPtr and ThisTimeLineID affect the
- * decision.  This may later be used to determine which xlog segment file to
- * open, etc.
+ * Determine which timeline to read an xlog page from and set the
+ * XLogReaderState's currTLI to that timeline ID.
+ *
+ * We care about timelines in xlogreader when we might be reading xlog
+ * generated prior to a promotion, either if we're currently a standby in
+ * recovery or if we're a promoted master reading xlogs generated by the old
+ * master before our promotion.
+ *
+ * wantPage must be set to the start address of the page to read and
+ * wantLength to the amount of the page that will be read, up to
+ * XLOG_BLCKSZ. If the amount to be read isn't known, pass XLOG_BLCKSZ.
  *
  * We switch to an xlog segment from the new timeline eagerly when on a
  * historical timeline, as soon as we reach the start of the xlog segment
@@ -768,130 +782,117 @@ XLogRead(char *buf, TimeLineID tli, XLogRecPtr startptr, Size count)
  * renamed with a .partial suffix so we can't necessarily keep reading from
  * the old TLI even though tliSwitchPoint says it's OK.
  *
+ * We can't just check the timeline when we read a page on a different segment
+ * to the last page. We could've received a timeline switch from a cascading
+ * upstream, so the current segment ends abruptly (possibly getting renamed to
+ * .partial) and we have to switch to a new one.  Even in the middle of reading
+ * a page we could have to dump the cached page and switch to a new TLI.
+ *
  * Because of this, callers MAY NOT assume that currTLI is the timeline that
  * will be in a page's xlp_tli; the page may begin on an older timeline or we
  * might be reading from historical timeline data on a segment that's been
  * copied to a new timeline.
+ *
+ * The caller must also make sure it doesn't read past the current replay
+ * position (using GetWalRcvWriteRecPtr) if executing in recovery, so it
+ * doesn't fail to notice that the current timeline became historical. The
+ * caller must also update ThisTimeLineID with the result of
+ * GetWalRcvWriteRecPtr and must check RecoveryInProgress().
  */
-static void
-XLogReadDetermineTimeline(XLogReaderState *state)
+void
+XLogReadDetermineTimeline(XLogReaderState *state, XLogRecPtr wantPage, uint32 wantLength)
 {
-	/* Read the history on first time through */
-	if (state->timelineHistory == NIL)
-		state->timelineHistory = readTimeLineHistory(ThisTimeLineID);
+	const XLogRecPtr lastReadPage = state->readSegNo *
+	state->wal_segment_size + state->readOff;
+
+	Assert(wantPage != InvalidXLogRecPtr && wantPage % XLOG_BLCKSZ == 0);
+	Assert(wantLength <= XLOG_BLCKSZ);
+	Assert(state->readLen == 0 || state->readLen <= XLOG_BLCKSZ);
 
 	/*
-	 * Are we reading the record immediately following the one we read last
-	 * time?  If not, then don't use the cached timeline info.
+	 * If the desired page is currently read in and valid, we have nothing to
+	 * do.
+	 *
+	 * The caller should've ensured that it didn't previously advance readOff
+	 * past the valid limit of this timeline, so it doesn't matter if the
+	 * current TLI has since become historical.
 	 */
-	if (state->currRecPtr != state->EndRecPtr)
+	if (lastReadPage == wantPage &&
+		state->readLen != 0 &&
+		lastReadPage + state->readLen >= wantPage + Min(wantLength, XLOG_BLCKSZ - 1))
+		return;
+
+	/*
+	 * If we're reading from the current timeline, it hasn't become historical
+	 * and the page we're reading is after the last page read, we can again
+	 * just carry on. (Seeking backwards requires a check to make sure the
+	 * older page isn't on a prior timeline).
+	 *
+	 * ThisTimeLineID might've become historical since we last looked, but the
+	 * caller is required not to read past the flush limit it saw at the time
+	 * it looked up the timeline. There's nothing we can do about it if
+	 * StartupXLOG() renames it to .partial concurrently.
+	 */
+	if (state->currTLI == ThisTimeLineID && wantPage >= lastReadPage)
 	{
-		state->currTLI = 0;
-		state->currTLIValidUntil = InvalidXLogRecPtr;
+		Assert(state->currTLIValidUntil == InvalidXLogRecPtr);
+		return;
 	}
 
 	/*
-	 * Are we reading a timeline that used to be the latest one, but became
-	 * historical?	This can happen in a replica that gets promoted, and in a
-	 * cascading replica whose upstream gets promoted.  In either case,
-	 * re-read the timeline history data.  We cannot read past the timeline
-	 * switch point, because either the records in the old timeline might be
-	 * invalid, or worse, they may valid but *different* from the ones we
-	 * should be reading.
+	 * If we're just reading pages from a previously validated historical
+	 * timeline and the timeline we're reading from is valid until the end of
+	 * the current segment we can just keep reading.
 	 */
-	if (state->currTLIValidUntil == InvalidXLogRecPtr &&
+	if (state->currTLIValidUntil != InvalidXLogRecPtr &&
 		state->currTLI != ThisTimeLineID &&
-		state->currTLI != 0)
-	{
-		/* re-read timeline history */
-		list_free_deep(state->timelineHistory);
-		state->timelineHistory = readTimeLineHistory(ThisTimeLineID);
-
-		elog(DEBUG2, "timeline %u became historical during decoding",
-			 state->currTLI);
-
-		/* then invalidate the cached timeline info */
-		state->currTLI = 0;
-		state->currTLIValidUntil = InvalidXLogRecPtr;
-	}
+		state->currTLI != 0 &&
+		((wantPage + wantLength) / state->wal_segment_size) <
+		(state->currTLIValidUntil / state->wal_segment_size))
+		return;
 
 	/*
-	 * Are we reading a record immediately following a timeline switch?  If
-	 * so, we must follow the switch too.
+	 * If we reach this point we're either looking up a page for random
+	 * access, the current timeline just became historical, or we're reading
+	 * from a new segment containing a timeline switch. In all cases we need
+	 * to determine the newest timeline on the segment.
+	 *
+	 * If it's the current timeline we can just keep reading from here unless
+	 * we detect a timeline switch that makes the current timeline historical.
+	 * If it's a historical timeline we can read all the segment on the newest
+	 * timeline because it contains all the old timelines' data too. So only
+	 * one switch check is required.
 	 */
-	if (state->currRecPtr == state->EndRecPtr &&
-		state->currTLI != 0 &&
-		state->currTLIValidUntil != InvalidXLogRecPtr &&
-		state->currRecPtr >= state->currTLIValidUntil)
 	{
-		elog(DEBUG2,
-			 "requested record %X/%X is on segment containing end of timeline %u valid until %X/%X, switching to next timeline",
-			 (uint32) (state->currRecPtr >> 32),
-			 (uint32) state->currRecPtr,
+		/*
+		 * We need to re-read the timeline history in case it's been changed
+		 * by a promotion or replay from a cascaded replica.
+		 */
+		List	   *timelineHistory = readTimeLineHistory(ThisTimeLineID);
+
+		XLogRecPtr	endOfSegment = (((wantPage / state->wal_segment_size) + 1)
+									* state->wal_segment_size) - 1;
+
+		Assert(wantPage / state->wal_segment_size ==
+			   endOfSegment / state->wal_segment_size);
+
+		/*
+		 * Find the timeline of the last LSN on the segment containing
+		 * wantPage.
+		 */
+		state->currTLI = tliOfPointInHistory(endOfSegment, timelineHistory);
+		state->currTLIValidUntil = tliSwitchPoint(state->currTLI, timelineHistory,
+												  &state->nextTLI);
+
+		Assert(state->currTLIValidUntil == InvalidXLogRecPtr ||
+			   wantPage + wantLength < state->currTLIValidUntil);
+
+		list_free_deep(timelineHistory);
+
+		elog(DEBUG3, "switched to timeline %u valid until %X/%X",
 			 state->currTLI,
 			 (uint32) (state->currTLIValidUntil >> 32),
 			 (uint32) (state->currTLIValidUntil));
-
-		/* invalidate TLI info so we look up the next TLI */
-		state->currTLI = 0;
-		state->currTLIValidUntil = InvalidXLogRecPtr;
-	}
-
-	if (state->currTLI == 0)
-	{
-		/*
-		 * Something changed; work out what timeline this record is on. We
-		 * might read it from the segment on this TLI or, if the segment is
-		 * also contained by newer timelines, the copy from a newer TLI.
-		 */
-		state->currTLI = tliOfPointInHistory(state->currRecPtr,
-											 state->timelineHistory);
-
-		/*
-		 * Look for the most recent timeline that's on the same xlog segment
-		 * as this record, since that's the only one we can assume is still
-		 * readable.
-		 */
-		while (state->currTLI != ThisTimeLineID &&
-			   state->currTLIValidUntil == InvalidXLogRecPtr)
-		{
-			XLogRecPtr	tliSwitch;
-			TimeLineID	nextTLI;
-
-			CHECK_FOR_INTERRUPTS();
-
-			tliSwitch = tliSwitchPoint(state->currTLI, state->timelineHistory,
-									   &nextTLI);
-
-			/* round ValidUntil down to start of seg containing the switch */
-			state->currTLIValidUntil =
-				((tliSwitch / XLogSegSize) * XLogSegSize);
-
-			if (state->currRecPtr >= state->currTLIValidUntil)
-			{
-				/*
-				 * The new currTLI ends on this WAL segment so check the next
-				 * TLI to see if it's the last one on the segment.
-				 *
-				 * If that's the current TLI we'll stop searching.
-				 */
-				state->currTLI = nextTLI;
-				state->currTLIValidUntil = InvalidXLogRecPtr;
-			}
-		}
-
-		/*
-		 * We're now either reading from the first xlog segment in the current
-		 * server's timeline or the most recent historical timeline that
-		 * exists on the target segment.
-		 */
-		elog(DEBUG2, "XLog read ptr %X/%X is on segment with TLI %u valid until %X/%X, server current TLI is %u",
-			 (uint32) (state->currRecPtr >> 32),
-			 (uint32) state->currRecPtr,
-			 state->currTLI,
-			 (uint32) (state->currTLIValidUntil >> 32),
-			 (uint32) (state->currTLIValidUntil),
-			 ThisTimeLineID);
 	}
 }
 
@@ -917,32 +918,52 @@ read_local_xlog_page(XLogReaderState *state, XLogRecPtr targetPagePtr,
 
 	loc = targetPagePtr + reqLen;
 
-	/* Make sure enough xlog is available... */
+	/* Loop waiting for xlog to be available if necessary */
 	while (1)
 	{
+		/*
+		 * Determine the limit of xlog we can currently read to, and what the
+		 * most recent timeline is.
+		 *
+		 * RecoveryInProgress() will update ThisTimeLineID when it first
+		 * notices recovery finishes, so we only have to maintain it for the
+		 * local process until recovery ends.
+		 */
+		if (!RecoveryInProgress())
+			read_upto = GetFlushRecPtr();
+		else
+			read_upto = GetXLogReplayRecPtr(&ThisTimeLineID);
+
+		*pageTLI = ThisTimeLineID;
+
 		/*
 		 * Check which timeline to get the record from.
 		 *
 		 * We have to do it each time through the loop because if we're in
 		 * recovery as a cascading standby, the current timeline might've
-		 * become historical.
+		 * become historical. We can't rely on RecoveryInProgress() because in
+		 * a standby configuration like
+		 *
+		 * A => B => C
+		 *
+		 * if we're a logical decoding session on C, and B gets promoted, our
+		 * timeline will change while we remain in recovery.
+		 *
+		 * We can't just keep reading from the old timeline as the last WAL
+		 * archive in the timeline will get renamed to .partial by
+		 * StartupXLOG().
+		 *
+		 * If that happens after our caller updated ThisTimeLineID but before
+		 * we actually read the xlog page, we might still try to read from the
+		 * old (now renamed) segment and fail. There's not much we can do
+		 * about this, but it can only happen when we're a leaf of a cascading
+		 * standby whose master gets promoted while we're decoding, so a
+		 * one-off ERROR isn't too bad.
 		 */
-		XLogReadDetermineTimeline(state);
+		XLogReadDetermineTimeline(state, targetPagePtr, reqLen);
 
 		if (state->currTLI == ThisTimeLineID)
 		{
-			/*
-			 * We're reading from the current timeline so we might have to
-			 * wait for the desired record to be generated (or, for a standby,
-			 * received & replayed)
-			 */
-			if (!RecoveryInProgress())
-			{
-				*pageTLI = ThisTimeLineID;
-				read_upto = GetFlushRecPtr();
-			}
-			else
-				read_upto = GetXLogReplayRecPtr(pageTLI);
 
 			if (loc <= read_upto)
 				break;
@@ -1001,7 +1022,8 @@ read_local_xlog_page(XLogReaderState *state, XLogRecPtr targetPagePtr,
 	 * as 'count', read the whole page anyway. It's guaranteed to be
 	 * zero-padded up to the page boundary if it's incomplete.
 	 */
-	XLogRead(cur_page, *pageTLI, targetPagePtr, XLOG_BLCKSZ);
+	XLogRead(cur_page, state->wal_segment_size, *pageTLI, targetPagePtr,
+			 XLOG_BLCKSZ);
 
 	/* number of valid bytes in the buffer */
 	return count;

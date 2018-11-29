@@ -3,7 +3,7 @@
  * nodeForeignscan.c
  *	  Routines to support scans of foreign tables
  *
- * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -62,7 +62,7 @@ ForeignNext(ForeignScanState *node)
 	 */
 	if (plan->fsSystemCol && !TupIsNull(slot))
 	{
-		HeapTuple	tup = ExecMaterializeSlot(slot);
+		HeapTuple	tup = ExecFetchSlotHeapTuple(slot, true, NULL);
 
 		tup->t_tableOid = RelationGetRelid(node->ss.ss_currentRelation);
 	}
@@ -101,7 +101,7 @@ ForeignRecheck(ForeignScanState *node, TupleTableSlot *slot)
 		!fdwroutine->RecheckForeignScan(node, slot))
 		return false;
 
-	return ExecQual(node->fdw_recheck_quals, econtext, false);
+	return ExecQual(node->fdw_recheck_quals, econtext);
 }
 
 /* ----------------------------------------------------------------
@@ -113,10 +113,12 @@ ForeignRecheck(ForeignScanState *node, TupleTableSlot *slot)
  *		access method functions.
  * ----------------------------------------------------------------
  */
-TupleTableSlot *
-ExecForeignScan(ForeignScanState *node)
+static TupleTableSlot *
+ExecForeignScan(PlanState *pstate)
 {
-	return ExecScan((ScanState *) node,
+	ForeignScanState *node = castNode(ForeignScanState, pstate);
+
+	return ExecScan(&node->ss,
 					(ExecScanAccessMtd) ForeignNext,
 					(ExecScanRecheckMtd) ForeignRecheck);
 }
@@ -144,6 +146,7 @@ ExecInitForeignScan(ForeignScan *node, EState *estate, int eflags)
 	scanstate = makeNode(ForeignScanState);
 	scanstate->ss.ps.plan = (Plan *) node;
 	scanstate->ss.ps.state = estate;
+	scanstate->ss.ps.ExecProcNode = ExecForeignScan;
 
 	/*
 	 * Miscellaneous initialization
@@ -152,30 +155,9 @@ ExecInitForeignScan(ForeignScan *node, EState *estate, int eflags)
 	 */
 	ExecAssignExprContext(estate, &scanstate->ss.ps);
 
-	scanstate->ss.ps.ps_TupFromTlist = false;
-
 	/*
-	 * initialize child expressions
-	 */
-	scanstate->ss.ps.targetlist = (List *)
-		ExecInitExpr((Expr *) node->scan.plan.targetlist,
-					 (PlanState *) scanstate);
-	scanstate->ss.ps.qual = (List *)
-		ExecInitExpr((Expr *) node->scan.plan.qual,
-					 (PlanState *) scanstate);
-	scanstate->fdw_recheck_quals = (List *)
-		ExecInitExpr((Expr *) node->fdw_recheck_quals,
-					 (PlanState *) scanstate);
-
-	/*
-	 * tuple table initialization
-	 */
-	ExecInitResultTupleSlot(estate, &scanstate->ss.ps);
-	ExecInitScanTupleSlot(estate, &scanstate->ss);
-
-	/*
-	 * open the base relation, if any, and acquire an appropriate lock on it;
-	 * also acquire function pointers from the FDW's handler
+	 * open the scan relation, if any; also acquire function pointers from the
+	 * FDW's handler
 	 */
 	if (scanrelid > 0)
 	{
@@ -197,23 +179,41 @@ ExecInitForeignScan(ForeignScan *node, EState *estate, int eflags)
 	{
 		TupleDesc	scan_tupdesc;
 
-		scan_tupdesc = ExecTypeFromTL(node->fdw_scan_tlist, false);
-		ExecAssignScanType(&scanstate->ss, scan_tupdesc);
+		scan_tupdesc = ExecTypeFromTL(node->fdw_scan_tlist);
+		ExecInitScanTupleSlot(estate, &scanstate->ss, scan_tupdesc,
+							  &TTSOpsHeapTuple);
 		/* Node's targetlist will contain Vars with varno = INDEX_VAR */
 		tlistvarno = INDEX_VAR;
 	}
 	else
 	{
-		ExecAssignScanType(&scanstate->ss, RelationGetDescr(currentRelation));
+		TupleDesc	scan_tupdesc;
+
+		/* don't trust FDWs to return tuples fulfilling NOT NULL constraints */
+		scan_tupdesc = CreateTupleDescCopy(RelationGetDescr(currentRelation));
+		ExecInitScanTupleSlot(estate, &scanstate->ss, scan_tupdesc,
+							  &TTSOpsHeapTuple);
 		/* Node's targetlist will contain Vars with varno = scanrelid */
 		tlistvarno = scanrelid;
 	}
 
+	/* Don't know what an FDW might return */
+	scanstate->ss.ps.scanopsfixed = false;
+	scanstate->ss.ps.scanopsset = true;
+
 	/*
-	 * Initialize result tuple type and projection info.
+	 * Initialize result slot, type and projection.
 	 */
-	ExecAssignResultTypeFromTL(&scanstate->ss.ps);
+	ExecInitResultTypeTL(&scanstate->ss.ps);
 	ExecAssignScanProjectionInfoWithVarno(&scanstate->ss, tlistvarno);
+
+	/*
+	 * initialize child expressions
+	 */
+	scanstate->ss.ps.qual =
+		ExecInitQual(node->scan.plan.qual, (PlanState *) scanstate);
+	scanstate->fdw_recheck_quals =
+		ExecInitQual(node->fdw_recheck_quals, (PlanState *) scanstate);
 
 	/*
 	 * Initialize FDW-related state.
@@ -262,12 +262,9 @@ ExecEndForeignScan(ForeignScanState *node)
 	ExecFreeExprContext(&node->ss.ps);
 
 	/* clean out the tuple table */
-	ExecClearTuple(node->ss.ps.ps_ResultTupleSlot);
+	if (node->ss.ps.ps_ResultTupleSlot)
+		ExecClearTuple(node->ss.ps.ps_ResultTupleSlot);
 	ExecClearTuple(node->ss.ss_ScanTupleSlot);
-
-	/* close the relation. */
-	if (node->ss.ss_currentRelation)
-		ExecCloseScanRelation(node->ss.ss_currentRelation);
 }
 
 /* ----------------------------------------------------------------
@@ -285,8 +282,8 @@ ExecReScanForeignScan(ForeignScanState *node)
 
 	/*
 	 * If chgParam of subnode is not null then plan will be re-scanned by
-	 * first ExecProcNode.  outerPlan may also be NULL, in which case there
-	 * is nothing to rescan at all.
+	 * first ExecProcNode.  outerPlan may also be NULL, in which case there is
+	 * nothing to rescan at all.
 	 */
 	if (outerPlan != NULL && outerPlan->chgParam == NULL)
 		ExecReScan(outerPlan);
@@ -336,13 +333,35 @@ ExecForeignScanInitializeDSM(ForeignScanState *node, ParallelContext *pcxt)
 }
 
 /* ----------------------------------------------------------------
- *		ExecForeignScanInitializeDSM
+ *		ExecForeignScanReInitializeDSM
+ *
+ *		Reset shared state before beginning a fresh scan.
+ * ----------------------------------------------------------------
+ */
+void
+ExecForeignScanReInitializeDSM(ForeignScanState *node, ParallelContext *pcxt)
+{
+	FdwRoutine *fdwroutine = node->fdwroutine;
+
+	if (fdwroutine->ReInitializeDSMForeignScan)
+	{
+		int			plan_node_id = node->ss.ps.plan->plan_node_id;
+		void	   *coordinate;
+
+		coordinate = shm_toc_lookup(pcxt->toc, plan_node_id, false);
+		fdwroutine->ReInitializeDSMForeignScan(node, pcxt, coordinate);
+	}
+}
+
+/* ----------------------------------------------------------------
+ *		ExecForeignScanInitializeWorker
  *
  *		Initialization according to the parallel coordination information
  * ----------------------------------------------------------------
  */
 void
-ExecForeignScanInitializeWorker(ForeignScanState *node, shm_toc *toc)
+ExecForeignScanInitializeWorker(ForeignScanState *node,
+								ParallelWorkerContext *pwcxt)
 {
 	FdwRoutine *fdwroutine = node->fdwroutine;
 
@@ -351,7 +370,23 @@ ExecForeignScanInitializeWorker(ForeignScanState *node, shm_toc *toc)
 		int			plan_node_id = node->ss.ps.plan->plan_node_id;
 		void	   *coordinate;
 
-		coordinate = shm_toc_lookup(toc, plan_node_id);
-		fdwroutine->InitializeWorkerForeignScan(node, toc, coordinate);
+		coordinate = shm_toc_lookup(pwcxt->toc, plan_node_id, false);
+		fdwroutine->InitializeWorkerForeignScan(node, pwcxt->toc, coordinate);
 	}
+}
+
+/* ----------------------------------------------------------------
+ *		ExecShutdownForeignScan
+ *
+ *		Gives FDW chance to stop asynchronous resource consumption
+ *		and release any resources still held.
+ * ----------------------------------------------------------------
+ */
+void
+ExecShutdownForeignScan(ForeignScanState *node)
+{
+	FdwRoutine *fdwroutine = node->fdwroutine;
+
+	if (fdwroutine->ShutdownForeignScan)
+		fdwroutine->ShutdownForeignScan(node);
 }

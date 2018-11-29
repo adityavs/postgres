@@ -3,7 +3,7 @@
  * xlogreader.h
  *		Definitions for the generic XLog reading facility
  *
- * Portions Copyright (c) 2013-2016, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2013-2018, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *		src/include/access/xlogreader.h
@@ -27,19 +27,15 @@
 
 #include "access/xlogrecord.h"
 
-#ifndef FRONTEND
-#include "nodes/pg_list.h"
-#endif
-
 typedef struct XLogReaderState XLogReaderState;
 
 /* Function type definition for the read_page callback */
 typedef int (*XLogPageReadCB) (XLogReaderState *xlogreader,
-										   XLogRecPtr targetPagePtr,
-										   int reqLen,
-										   XLogRecPtr targetRecPtr,
-										   char *readBuf,
-										   TimeLineID *pageTLI);
+							   XLogRecPtr targetPagePtr,
+							   int reqLen,
+							   XLogRecPtr targetRecPtr,
+							   char *readBuf,
+							   TimeLineID *pageTLI);
 
 typedef struct
 {
@@ -55,7 +51,8 @@ typedef struct
 	uint8		flags;
 
 	/* Information on full-page image, if any */
-	bool		has_image;
+	bool		has_image;		/* has image, even for consistency checking */
+	bool		apply_image;	/* has image that should be restored */
 	char	   *bkp_image;
 	uint16		hole_offset;
 	uint16		hole_length;
@@ -75,6 +72,11 @@ struct XLogReaderState
 	 * Public parameters
 	 * ----------------------------------------
 	 */
+
+	/*
+	 * Segment size of the to-be-parsed data (mandatory).
+	 */
+	int			wal_segment_size;
 
 	/*
 	 * Data input callback (mandatory).
@@ -166,29 +168,37 @@ struct XLogReaderState
 	XLogRecPtr	currRecPtr;
 	/* timeline to read it from, 0 if a lookup is required */
 	TimeLineID	currTLI;
+
 	/*
-	 * Safe point to read to in currTLI.  If currTLI is historical, then this
-	 * is set to the end of the last whole segment that contains that TLI;
-	 * if currTLI is ThisTimeLineID, this is InvalidXLogRecPtr.  This is *not*
-	 * the tliSwitchPoint.
+	 * Safe point to read to in currTLI if current TLI is historical
+	 * (tliSwitchPoint) or InvalidXLogRecPtr if on current timeline.
+	 *
+	 * Actually set to the start of the segment containing the timeline switch
+	 * that ends currTLI's validity, not the LSN of the switch its self, since
+	 * we can't assume the old segment will be present.
 	 */
 	XLogRecPtr	currTLIValidUntil;
 
-	/* Buffer for current ReadRecord result (expandable) */
+	/*
+	 * If currTLI is not the most recent known timeline, the next timeline to
+	 * read from when currTLIValidUntil is reached.
+	 */
+	TimeLineID	nextTLI;
+
+	/*
+	 * Buffer for current ReadRecord result (expandable), used when a record
+	 * crosses a page boundary.
+	 */
 	char	   *readRecordBuf;
 	uint32		readRecordBufSize;
-
-#ifndef FRONTEND
-	/* cached timeline history, only available in backend */
-	List	   *timelineHistory;
-#endif
 
 	/* Buffer to hold error message */
 	char	   *errormsg_buf;
 };
 
 /* Get a new XLogReader */
-extern XLogReaderState *XLogReaderAllocate(XLogPageReadCB pagereadfunc,
+extern XLogReaderState *XLogReaderAllocate(int wal_segment_size,
+				   XLogPageReadCB pagereadfunc,
 				   void *private_data);
 
 /* Free an XLogReader */
@@ -198,12 +208,16 @@ extern void XLogReaderFree(XLogReaderState *state);
 extern struct XLogRecord *XLogReadRecord(XLogReaderState *state,
 			   XLogRecPtr recptr, char **errormsg);
 
+/* Validate a page */
+extern bool XLogReaderValidatePageHeader(XLogReaderState *state,
+							 XLogRecPtr recptr, char *phdr);
+
 /* Invalidate read state */
 extern void XLogReaderInvalReadState(XLogReaderState *state);
 
 #ifdef FRONTEND
 extern XLogRecPtr XLogFindNextRecord(XLogReaderState *state, XLogRecPtr RecPtr);
-#endif   /* FRONTEND */
+#endif							/* FRONTEND */
 
 /* Functions for decoding an XLogRecord */
 
@@ -223,6 +237,8 @@ extern bool DecodeXLogRecord(XLogReaderState *state, XLogRecord *record,
 	((decoder)->blocks[block_id].in_use)
 #define XLogRecHasBlockImage(decoder, block_id) \
 	((decoder)->blocks[block_id].has_image)
+#define XLogRecBlockImageApply(decoder, block_id) \
+	((decoder)->blocks[block_id].apply_image)
 
 extern bool RestoreBlockImage(XLogReaderState *recoder, uint8 block_id, char *dst);
 extern char *XLogRecGetBlockData(XLogReaderState *record, uint8 block_id, Size *len);
@@ -230,4 +246,4 @@ extern bool XLogRecGetBlockTag(XLogReaderState *record, uint8 block_id,
 				   RelFileNode *rnode, ForkNumber *forknum,
 				   BlockNumber *blknum);
 
-#endif   /* XLOGREADER_H */
+#endif							/* XLOGREADER_H */

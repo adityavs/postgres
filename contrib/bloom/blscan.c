@@ -3,7 +3,7 @@
  * blscan.c
  *		Bloom index scan functions.
  *
- * Copyright (c) 2016, PostgreSQL Global Development Group
+ * Copyright (c) 2016-2018, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  contrib/bloom/blscan.c
@@ -29,8 +29,15 @@ IndexScanDesc
 blbeginscan(Relation r, int nkeys, int norderbys)
 {
 	IndexScanDesc scan;
+	BloomScanOpaque so;
 
 	scan = RelationGetIndexScan(r, nkeys, norderbys);
+
+	so = (BloomScanOpaque) palloc(sizeof(BloomScanOpaqueData));
+	initBloomState(&so->state, scan->indexRelation);
+	so->sign = NULL;
+
+	scan->opaque = so;
 
 	return scan;
 }
@@ -42,23 +49,10 @@ void
 blrescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
 		 ScanKey orderbys, int norderbys)
 {
-	BloomScanOpaque so;
+	BloomScanOpaque so = (BloomScanOpaque) scan->opaque;
 
-	so = (BloomScanOpaque) scan->opaque;
-
-	if (so == NULL)
-	{
-		/* if called from blbeginscan */
-		so = (BloomScanOpaque) palloc(sizeof(BloomScanOpaqueData));
-		initBloomState(&so->state, scan->indexRelation);
-		scan->opaque = so;
-
-	}
-	else
-	{
-		if (so->sign)
-			pfree(so->sign);
-	}
+	if (so->sign)
+		pfree(so->sign);
 	so->sign = NULL;
 
 	if (scankey && scan->numberOfKeys > 0)
@@ -82,7 +76,7 @@ blendscan(IndexScanDesc scan)
 }
 
 /*
- * Insert all matching tuples into to a bitmap.
+ * Insert all matching tuples into a bitmap.
  */
 int64
 blgetbitmap(IndexScanDesc scan, TIDBitmap *tbm)
@@ -99,7 +93,7 @@ blgetbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 		/* New search: have to calculate search signature */
 		ScanKey		skey = scan->keyData;
 
-		so->sign = palloc0(sizeof(SignType) * so->state.opts.bloomLength);
+		so->sign = palloc0(sizeof(BloomSignatureWord) * so->state.opts.bloomLength);
 
 		for (i = 0; i < scan->numberOfKeys; i++)
 		{
@@ -138,10 +132,10 @@ blgetbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 									blkno, RBM_NORMAL, bas);
 
 		LockBuffer(buffer, BUFFER_LOCK_SHARE);
-		page = BufferGetPage(buffer, scan->xs_snapshot, scan->indexRelation,
-							 BGP_TEST_FOR_OLD_SNAPSHOT);
+		page = BufferGetPage(buffer);
+		TestForOldSnapshot(scan->xs_snapshot, scan->indexRelation, page);
 
-		if (!BloomPageIsDeleted(page))
+		if (!PageIsNew(page) && !BloomPageIsDeleted(page))
 		{
 			OffsetNumber offset,
 						maxOffset = BloomPageGetMaxOffset(page);

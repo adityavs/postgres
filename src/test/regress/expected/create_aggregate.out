@@ -71,7 +71,8 @@ create aggregate my_percentile_disc(float8 ORDER BY anyelement) (
   stype = internal,
   sfunc = ordered_set_transition,
   finalfunc = percentile_disc_final,
-  finalfunc_extra = true
+  finalfunc_extra = true,
+  finalfunc_modify = read_write
 );
 create aggregate my_rank(VARIADIC "any" ORDER BY VARIADIC "any") (
   stype = internal,
@@ -102,36 +103,19 @@ CREATE AGGREGATE sumdouble (float8)
     minvfunc = float8mi
 );
 -- aggregate combine and serialization functions
--- Ensure stype and serialtype can't be the same
+-- can't specify just one of serialfunc and deserialfunc
 CREATE AGGREGATE myavg (numeric)
 (
 	stype = internal,
 	sfunc = numeric_avg_accum,
-	serialtype = internal
-);
-ERROR:  aggregate serialization type cannot be "internal"
--- if serialtype is specified we need a serialfunc and deserialfunc
-CREATE AGGREGATE myavg (numeric)
-(
-	stype = internal,
-	sfunc = numeric_avg_accum,
-	serialtype = bytea
-);
-ERROR:  aggregate serialization function must be specified when serialization type is specified
-CREATE AGGREGATE myavg (numeric)
-(
-	stype = internal,
-	sfunc = numeric_avg_accum,
-	serialtype = bytea,
 	serialfunc = numeric_avg_serialize
 );
-ERROR:  aggregate deserialization function must be specified when serialization type is specified
+ERROR:  must specify both or neither of serialization and deserialization functions
 -- serialfunc must have correct parameters
 CREATE AGGREGATE myavg (numeric)
 (
 	stype = internal,
 	sfunc = numeric_avg_accum,
-	serialtype = bytea,
 	serialfunc = numeric_avg_deserialize,
 	deserialfunc = numeric_avg_deserialize
 );
@@ -141,27 +125,15 @@ CREATE AGGREGATE myavg (numeric)
 (
 	stype = internal,
 	sfunc = numeric_avg_accum,
-	serialtype = bytea,
 	serialfunc = numeric_avg_serialize,
 	deserialfunc = numeric_avg_serialize
 );
-ERROR:  function numeric_avg_serialize(bytea) does not exist
--- ensure return type of serialfunc is checked
-CREATE AGGREGATE myavg (numeric)
-(
-	stype = internal,
-	sfunc = numeric_avg_accum,
-	serialtype = text,
-	serialfunc = numeric_avg_serialize,
-	deserialfunc = numeric_avg_deserialize
-);
-ERROR:  return type of serialization function numeric_avg_serialize is not text
+ERROR:  function numeric_avg_serialize(bytea, internal) does not exist
 -- ensure combine function parameters are checked
 CREATE AGGREGATE myavg (numeric)
 (
 	stype = internal,
 	sfunc = numeric_avg_accum,
-	serialtype = bytea,
 	serialfunc = numeric_avg_serialize,
 	deserialfunc = numeric_avg_deserialize,
 	combinefunc = int4larger
@@ -173,18 +145,19 @@ CREATE AGGREGATE myavg (numeric)
 	stype = internal,
 	sfunc = numeric_avg_accum,
 	finalfunc = numeric_avg,
-	serialtype = bytea,
 	serialfunc = numeric_avg_serialize,
 	deserialfunc = numeric_avg_deserialize,
-	combinefunc = numeric_avg_combine
+	combinefunc = numeric_avg_combine,
+	finalfunc_modify = shareable  -- just to test a non-default setting
 );
 -- Ensure all these functions made it into the catalog
-SELECT aggfnoid,aggtransfn,aggcombinefn,aggtranstype,aggserialfn,aggdeserialfn,aggserialtype
+SELECT aggfnoid, aggtransfn, aggcombinefn, aggtranstype::regtype,
+       aggserialfn, aggdeserialfn, aggfinalmodify
 FROM pg_aggregate
 WHERE aggfnoid = 'myavg'::REGPROC;
- aggfnoid |    aggtransfn     |    aggcombinefn     | aggtranstype |      aggserialfn      |      aggdeserialfn      | aggserialtype 
-----------+-------------------+---------------------+--------------+-----------------------+-------------------------+---------------
- myavg    | numeric_avg_accum | numeric_avg_combine |         2281 | numeric_avg_serialize | numeric_avg_deserialize |            17
+ aggfnoid |    aggtransfn     |    aggcombinefn     | aggtranstype |      aggserialfn      |      aggdeserialfn      | aggfinalmodify 
+----------+-------------------+---------------------+--------------+-----------------------+-------------------------+----------------
+ myavg    | numeric_avg_accum | numeric_avg_combine | internal     | numeric_avg_serialize | numeric_avg_deserialize | s
 (1 row)
 
 DROP AGGREGATE myavg (numeric);
@@ -222,3 +195,33 @@ CREATE AGGREGATE wrongreturntype (float8)
     minvfunc = float8mi_int
 );
 ERROR:  return type of inverse transition function float8mi_int is not double precision
+-- invalid: non-lowercase quoted identifiers
+CREATE AGGREGATE case_agg ( -- old syntax
+	"Sfunc1" = int4pl,
+	"Basetype" = int4,
+	"Stype1" = int4,
+	"Initcond1" = '0',
+	"Parallel" = safe
+);
+WARNING:  aggregate attribute "Sfunc1" not recognized
+WARNING:  aggregate attribute "Basetype" not recognized
+WARNING:  aggregate attribute "Stype1" not recognized
+WARNING:  aggregate attribute "Initcond1" not recognized
+WARNING:  aggregate attribute "Parallel" not recognized
+ERROR:  aggregate stype must be specified
+CREATE AGGREGATE case_agg(float8)
+(
+	"Stype" = internal,
+	"Sfunc" = ordered_set_transition,
+	"Finalfunc" = percentile_disc_final,
+	"Finalfunc_extra" = true,
+	"Finalfunc_modify" = read_write,
+	"Parallel" = safe
+);
+WARNING:  aggregate attribute "Stype" not recognized
+WARNING:  aggregate attribute "Sfunc" not recognized
+WARNING:  aggregate attribute "Finalfunc" not recognized
+WARNING:  aggregate attribute "Finalfunc_extra" not recognized
+WARNING:  aggregate attribute "Finalfunc_modify" not recognized
+WARNING:  aggregate attribute "Parallel" not recognized
+ERROR:  aggregate stype must be specified
